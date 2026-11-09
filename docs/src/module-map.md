@@ -378,6 +378,7 @@ The authorization vectors are in `capability/vectors/`.
 - `scripts/build.mjs`: assembles `bin/libraries/`, including the esbuild worker bundles, and `bin/build-info.json`.
   `scripts/library-assets.mjs` maps each served file to its source.
 - `scripts/build-embed.mjs`: bundles `src/embed/` into `bin/libraries/webgpu-player/EmbeddedPlayer.js` and copies the built decoder packages to `bin/libraries/wgpud/`.
+- `scripts/package-embed.mjs`: assembles `bin/libraries/` as the npm package `scripts/embed-package.json` describes, in `bin/package/`.
 - `scripts/pinned-releases.mjs`: installs the pinned decoder and pass releases into `bin/wgpud/` and `bin/wgpup/`, recording them in `bin/installed-releases.json`, and with `--pin` pins a release in `tools/pinned-releases.json`.
   See [Pinned releases](decoders.md#pinned-releases).
 - `scripts/decoder-packages.mjs`: builds the decoder projects into `bin/wgpud/`, or checks them against it.

@@ -1,0 +1,62 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  # By hand it only builds and packs, unless dry-run is unticked
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and pack without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  # Trusted publishing: npm checks the workflow's OIDC token, so there's no NPM_TOKEN
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the engine
+        uses: actions/checkout@v7
+
+      # The build reads Mediabunny's fork and the decoder and pass projects' license texts; the codec sources are not needed
+      - name: Check out the submodules the build reads
+        run: git submodule update --init vendor/mediabunny wgpud wgpup
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the pinned decoder packages and passes
+        run: node scripts/pinned-releases.mjs
+
+      - name: Build the engine's WebAssembly
+        run: |
+          docker run --rm -v "$PWD:/engine" -w /engine emscripten/emsdk:4.0.13 sh -c '
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal &&
+            . "$HOME/.cargo/env" &&
+            make -C wasm all'
+
+      - name: Build the served assets and the embedding module
+        run: |
+          node scripts/build.mjs --production
+          node scripts/build-embed.mjs --production
+          node scripts/package-embed.mjs
+
+      - name: Publish
+        working-directory: bin/package
+        run: npm publish ${{ (github.event_name == 'workflow_dispatch' && inputs.dry-run) && '--dry-run' || '' }}

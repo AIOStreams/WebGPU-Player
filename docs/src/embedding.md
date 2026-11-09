@@ -52,6 +52,9 @@ A source it has no route for, or a route that falls back, comes back to the host
    It sets the asset base from its own URL and puts the presenter's styles in the page.
 3. Create the player with a `PresentationSurface`, and open a URL the page may fetch with byte ranges.
 
+`node <engine>/scripts/package-embed.mjs` then assembles the served assets as the npm package `@aiostreams/webgpu-player` in `bin/package/`, the decoder packages with their licenses and where their source is.
+The Publish workflow builds and publishes it for a release.
+
 A Dolby Vision stream is described by its base layer.
 
 ## How assets are named and served
