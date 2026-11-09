@@ -234,6 +234,8 @@ export type CustomDecodeSessionTelemetry = {
     pendingFrameCount: number
     /** The source bytes the latest run reported reading before its readiness, in steps of `SOURCE_PROGRESS_REPORT_BYTE_COUNT` */
     preparationSourceByteCount: number
+    /** Frame-pool frames that ended before the generation's start, released unpresented */
+    prerollFrameCount: number
     queuedFrameCount: number
     receivedAudioFrameCount: number
     receivedAudioSampleCount: number
@@ -385,6 +387,7 @@ function createTelemetry(): CustomDecodeSessionTelemetry {
         peakFrameCount: 0,
         pendingFrameCount: 0,
         preparationSourceByteCount: 0,
+        prerollFrameCount: 0,
         queuedFrameCount: 0,
         receivedAudioFrameCount: 0,
         receivedAudioSampleCount: 0,
@@ -2143,6 +2146,14 @@ export default class CustomDecodeSession {
     private enqueueFramePoolFrame(generationRecord: GenerationRecord, presentationFrame: DecodedFramePoolPresentationFrame): void {
         if (!this.isGenerationCurrent(generationRecord) || (presentationFrame.videoEpoch ?? 0) !== generationRecord.videoEpoch) {
             this.telemetry.staleFrameCount += 1;
+            this.gpuVideoDecodeFeed?.releaseFrame(presentationFrame);
+            return;
+        }
+        // The GPU decoder decodes from the key packet before the start, and the frames before it would make video ready early
+        const frameEndMicroseconds = addMicroseconds(presentationFrame.mediaTimeMicroseconds, presentationFrame.durationMicroseconds);
+        if (presentationFrame.mediaTimeMicroseconds < generationRecord.startTimeMicroseconds
+            && frameEndMicroseconds <= generationRecord.startTimeMicroseconds) {
+            this.telemetry.prerollFrameCount += 1;
             this.gpuVideoDecodeFeed?.releaseFrame(presentationFrame);
             return;
         }
