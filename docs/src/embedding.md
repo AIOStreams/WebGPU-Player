@@ -40,6 +40,20 @@ Read the engine's folders from `tools/constants.json` (`sourceDirectory`, `scrip
 
    Pass `baseURL` to serve the assets from somewhere other than `libraries/`.
 
+## Without a media server
+
+A host that plays URLs with no server-side probe of the file can import one served module instead of the sources.
+`EmbeddedPlayer` describes the source in the page with Mediabunny, runs the eligibility, and drives the presenter, controller, and frame loop behind `open`, `play`, `pause`, `seek`, and `setAudio`.
+A source it has no route for, or a route that falls back, comes back to the host as a reason and a position, for the host's own player.
+
+1. Build the served assets, then the module: `node <engine>/scripts/build-embed.mjs` after `node <engine>/scripts/build.mjs`.
+   It writes `libraries/webgpu-player/EmbeddedPlayer.js` and copies the built decoder packages to `libraries/wgpud/`, of which the module loads those a source's codecs need.
+2. Serve `<engine>/bin/libraries/` as above, and import the module from it at run time.
+   It sets the asset base from its own URL and puts the presenter's styles in the page.
+3. Create the player with a `PresentationSurface`, and open a URL the page may fetch with byte ranges.
+
+A Dolby Vision stream is described by its base layer.
+
 ## How assets are named and served
 
 - `src/EngineAssets.ts` names every runtime asset, `scripts/library-assets.mjs` maps each served file to its source, and the `EngineAssets` test keeps the two in agreement.

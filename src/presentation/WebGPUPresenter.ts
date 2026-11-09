@@ -1642,6 +1642,11 @@ export default class WebGPUPresenter {
         return { ...this.telemetry };
     }
 
+    /** Without copying the telemetry, for a host that reads it every frame. */
+    getLastPresentedMediaTime(): Microseconds | null {
+        return this.telemetry.lastPresentedMediaTimeMicroseconds;
+    }
+
     /** Returns a detached snapshot of the active renderer controls. */
     getRenderSettings(): RenderSettings {
         return cloneRenderSettings(this.settings);

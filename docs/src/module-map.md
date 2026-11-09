@@ -339,6 +339,11 @@ The authorization vectors are in `capability/vectors/`.
 - `GPUCanvasReadback.ts`: bounded GPU canvas pixel readback (5 s).
 - `GPUErrorScope.ts`: the validation error scope the authorizations and the canvas readback push and pop in one task around their submit (`captureValidationErrors`), and its cleanup.
 
+## embed/
+
+- `EmbeddedPlayer.ts` [main]: the engine as one served module, for a host without a media server's probe; see [Embedding the engine](embedding.md#without-a-media-server).
+- `DescribeSource.ts` [main]: a URL described as a Jellyfin media source with Mediabunny, its codec facts read from the RFC 6381 codec string and HEVC's configuration record.
+
 ## Outside src/
 
 - `test/helpers/enginePaths.ts`: the engine root and the `node_modules` location, independent of the test runner's working directory, and the folders from `tools/constants.json`.
@@ -372,6 +377,7 @@ The authorization vectors are in `capability/vectors/`.
 - `vendor/`: the FFmpeg and dcadec submodules (`update = none`), which `make -C wgpud sources` fetches.
 - `scripts/build.mjs`: assembles `bin/libraries/`, including the esbuild worker bundles, and `bin/build-info.json`.
   `scripts/library-assets.mjs` maps each served file to its source.
+- `scripts/build-embed.mjs`: bundles `src/embed/` into `bin/libraries/webgpu-player/EmbeddedPlayer.js` and copies the built decoder packages to `bin/libraries/wgpud/`.
 - `scripts/pinned-releases.mjs`: installs the pinned decoder and pass releases into `bin/wgpud/` and `bin/wgpup/`, recording them in `bin/installed-releases.json`, and with `--pin` pins a release in `tools/pinned-releases.json`.
   See [Pinned releases](decoders.md#pinned-releases).
 - `scripts/decoder-packages.mjs`: builds the decoder projects into `bin/wgpud/`, or checks them against it.
