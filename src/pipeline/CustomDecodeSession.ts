@@ -677,6 +677,10 @@ function hasValidRawVideoFrameFormat(options: CustomDecodeSessionStartOptions): 
     }
 }
 
+function getErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 function describeInvalidFrameFormat(videoOutputMode: CustomDecodeVideoOutputMode): string {
     switch (videoOutputMode) {
         case 'frame-pool':
@@ -2046,8 +2050,8 @@ export default class CustomDecodeSession {
         let audioBridgeResult: CustomDecodeAudioBridge | Promise<CustomDecodeAudioBridge>;
         try {
             audioBridgeResult = audioBridgeFactory(audioConfiguration);
-        } catch {
-            this.handleAudioOutputFailure(generationRecord, 'Unable to create decoded audio output');
+        } catch (error) {
+            this.handleAudioOutputFailure(generationRecord, `Unable to create decoded audio output: ${getErrorMessage(error)}`);
             return;
         }
         void Promise.resolve(audioBridgeResult).then(
@@ -2057,9 +2061,9 @@ export default class CustomDecodeSession {
                 }
                 this.completeReady(generationRecord, videoCodec, audioConfiguration, audioBridge);
             },
-            (): void => {
+            (error: unknown): void => {
                 if (this.isGenerationCurrent(generationRecord)) {
-                    this.handleAudioOutputFailure(generationRecord, 'Unable to create decoded audio output');
+                    this.handleAudioOutputFailure(generationRecord, `Unable to create decoded audio output: ${getErrorMessage(error)}`);
                 }
             }
         );
