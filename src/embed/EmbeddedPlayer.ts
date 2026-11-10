@@ -21,6 +21,7 @@ import { loadDecoderPackage, type AudioDecoderPackage, type VideoDecoderPackage 
 import { configureEngineAssets } from '../EngineAssets';
 import { configureEngineFeatureFlags } from '../EngineConfiguration';
 import type { Microseconds } from '../MediaTime';
+import type { ContainerSubtitleBlock } from '../pipeline/DecodeWorkerProtocol';
 import CustomPlaybackController from '../pipeline/CustomPlaybackController';
 import type {
     CustomPlaybackControllerEvent,
@@ -74,7 +75,11 @@ export type EmbeddedPlayerEvents = Readonly<{
     /** The engine gave up; the host plays the source its own way from `atMs`. */
     onFallback(reason: string, atMs: number): void
     onError(message: string): void
+    /** A Matroska file's blocks of tracks the engine doesn't play, such as its subtitles, as the engine reads past them. */
+    onSubtitleBlocks?(blocks: readonly EmbeddedSubtitleBlock[]): void
 }>;
+
+export type EmbeddedSubtitleBlock = ContainerSubtitleBlock;
 
 export type EmbeddedOpenRequest = Readonly<{
     url: string
@@ -417,6 +422,9 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
                 break;
             case 'static-hdr-metadata':
                 applyStaticHDRMetadata(route, event.metadata);
+                break;
+            case 'subtitle-blocks':
+                events.onSubtitleBlocks?.(event.blocks);
                 break;
             default:
                 break;

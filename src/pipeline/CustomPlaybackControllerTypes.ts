@@ -21,6 +21,7 @@ import type {
     CustomDecodeSessionTelemetry
 } from './CustomDecodeSession';
 import type {
+    ContainerSubtitleBlock,
     CustomDecodeFailureKind,
     CustomDecodeAudioMetadataLayout,
     CustomDecodeAudioOutputMode,
@@ -276,6 +277,11 @@ export type CustomPlaybackTelemetry = {
 };
 
 export type CustomPlaybackControllerEvent =
+    | {
+        blocks: readonly ContainerSubtitleBlock[]
+        generation: number
+        type: 'subtitle-blocks'
+    }
     | {
         generation: number
         /** Channels the new device accepts, or null when unknown */

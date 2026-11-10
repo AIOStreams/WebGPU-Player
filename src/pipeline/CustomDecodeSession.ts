@@ -51,6 +51,7 @@ import {
     isVideoOutputMode,
     MAX_DECODED_FRAME_CREDITS,
     MAX_DECODED_RAW_FRAME_CREDITS,
+    type ContainerSubtitleBlock,
     type CustomDecodeFailureKind,
     type CustomDecodeAudioMetadataLayout,
     type CustomDecodeAudioOutputMode,
@@ -159,6 +160,11 @@ export type CustomDecodeSessionEvent =
         audioEpoch: number
         generation: number
         type: 'audio-resynced'
+    }
+    | {
+        blocks: readonly ContainerSubtitleBlock[]
+        generation: number
+        type: 'subtitle-blocks'
     }
     | {
         audio: DecodeWorkerReadyAudioConfiguration | null
@@ -1876,6 +1882,9 @@ export default class CustomDecodeSession {
         }
 
         switch (messageValue.type) {
+            case 'subtitle-blocks':
+                this.emitEvent({ blocks: messageValue.blocks, generation: messageValue.generation, type: 'subtitle-blocks' });
+                return;
             case 'progress':
                 this.telemetry.submittedVideoPacketCount = messageValue.packetCount;
                 this.telemetry.videoProgressPhase = messageValue.phase;

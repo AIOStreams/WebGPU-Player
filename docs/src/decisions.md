@@ -1446,6 +1446,8 @@ These were settled on Firefox 157 on Windows.
   A release's files are pinned by SHA-256 because they come from outside the checkout, unlike the engine's own assets, which typed names replaced hash pins for (10-02).
   `libaom-PATENTS` was dropped from the decoders repository's `licenses/`, and never entered its history.
   Each repository has a short README that points to this book, and a LICENSE, a copy of the engine's.
+- Changes the engine needs ahead of the fork are patches in `patches/mediabunny/`, which `scripts/mediabunny.mjs` applies to the checkout before a build and names in the build stamp (11-10).
+  `0001-matroska-other-track-blocks.patch` adds `formatOptions.matroska.onOtherTrackBlock`, which reports the blocks of tracks no input track reads; the worker posts them as `subtitle-blocks` and `EmbeddedPlayer` hands them to the host as `onSubtitleBlocks`.
 - Mediabunny comes from the user's fork, vendored as a submodule and aliased, not installed (10-15).
   The fork, [alchemyyy/mediabunny](https://github.com/alchemyyy/mediabunny), is Mediabunny 1.61.5 with six upstream pull requests merged, each in a merge commit named after it with its authors' commits kept: #155 (AVI), #156 (MPEG-4 Part 2), #298 (MP4 chapters), #409 (AIFF), #443 (ASS subtitle muxing), and #495 (`getUnsupportedFeatures`).
   On top of them the fork times AVI audio chunks as FFmpeg's `get_duration` does, maps WAVE_FORMAT_EXTENSIBLE AVI audio and reports its channel mask, describes FLAC and Vorbis in AVI (`v2-avi-wave-format-extensible`, `v2-avi-flac-vorbis`), reads AVI OpenDML indexes and unpacks DivX packed B-frames (`v2-avi-opendml-index`, `v2-avi-unpack-packed-bframes`), and demuxes MPEG-1, MPEG-2, and VC-1 from MPEG-TS and M2TS.

@@ -46,6 +46,7 @@ A host that plays URLs with no server-side probe of the file can import one serv
 `EmbeddedPlayer` describes the source in the page with Mediabunny, runs the eligibility, and drives the presenter, controller, and frame loop behind `open`, `play`, `pause`, `seek`, and `setAudio`.
 `setPasses` hands the presenter pass files (see [Create a new WebGPU pass](new-pass.md)), as `setPresentationPreset` does, and `stats` names the passes the current plan runs.
 A source it has no route for, or a route that falls back, comes back to the host as a reason and a position, for the host's own player.
+The optional `onSubtitleBlocks` event hands the host a Matroska file's blocks of the tracks the engine doesn't play, such as its subtitles, as the worker parses their clusters, so a host draws subtitles without reading the file again; a cluster parsed again sends its blocks again.
 
 1. Build the served assets, then the module: `node <engine>/scripts/build-embed.mjs` after `node <engine>/scripts/build.mjs`.
    It writes `libraries/webgpu-player/EmbeddedPlayer.js` and copies the built decoder packages to `libraries/wgpud/`, of which the module loads those a source's codecs need.

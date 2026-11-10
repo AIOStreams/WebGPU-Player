@@ -87,6 +87,7 @@ export const MAXIMUM_VIDEO_STARTUP_PROGRESS_PACKET_COUNT = 512;
 /** The source bytes a run reads before its readiness between two `source-progress` responses: a read that moves slower than this per quiet bound looks stalled. */
 export const SOURCE_PROGRESS_REPORT_BYTE_COUNT = 256 * 1024;
 const MAXIMUM_CODEC_ASSET_URL_LENGTH = 2_048;
+export const MAXIMUM_SUBTITLE_BLOCKS_PER_MESSAGE = 4_096;
 
 /**
  * How decoded video reaches the presenter: a VideoFrame, raw planes in a transferred buffer, or a GPU decoder's frame pool on the presenter's device.
@@ -622,6 +623,22 @@ export type DecodeWorkerAudioObjectCountResponse = {
     type: 'audio-object-count'
 };
 
+/** A block of a Matroska track the engine doesn't play, such as a subtitle track, in the container's time. */
+export type ContainerSubtitleBlock = {
+    trackNumber: number
+    timestampMs: number
+    durationMs: number | null
+    /** As stored, before any content encoding is undone */
+    data: Uint8Array
+};
+
+/** The blocks of tracks the engine doesn't play, from the clusters the demuxer parsed. */
+export type DecodeWorkerSubtitleBlocksResponse = {
+    blocks: readonly ContainerSubtitleBlock[]
+    generation: number
+    type: 'subtitle-blocks'
+};
+
 /** Carries a batch of the worker's timing trace events. */
 export type DecodeWorkerTimingTraceResponse = {
     events: readonly WorkerTimingTraceEvent[]
@@ -644,12 +661,22 @@ export type DecodeWorkerResponse =
     | DecodeWorkerReadyResponse
     | DecodeWorkerSourceProgressResponse
     | DecodeWorkerStoppedResponse
+    | DecodeWorkerSubtitleBlocksResponse
     | DecodeWorkerTimingTraceResponse
     | DecodeWorkerVideoEndedResponse
     | DecodeWorkerVideoInterruptedResponse;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return Boolean(value) && typeof value === 'object';
+}
+
+function isContainerSubtitleBlock(value: unknown): value is ContainerSubtitleBlock {
+    return isRecord(value)
+        && Number.isSafeInteger(value.trackNumber)
+        && Number(value.trackNumber) > 0
+        && Number.isFinite(value.timestampMs)
+        && (value.durationMs === null || (Number.isFinite(value.durationMs) && Number(value.durationMs) >= 0))
+        && value.data instanceof Uint8Array;
 }
 
 function isGeneration(value: unknown): value is number {
@@ -1550,6 +1577,11 @@ export function isDecodeWorkerResponse(value: unknown): value is DecodeWorkerRes
             return isVideoEpoch(value.videoEpoch, true) && hasValidOptionalOutputEvents(value);
         case 'video-interrupted':
             return value.reason === 'decoder-reclaimed' && isVideoEpoch(value.videoEpoch, true);
+        case 'subtitle-blocks':
+            return Array.isArray(value.blocks)
+                && value.blocks.length > 0
+                && value.blocks.length <= MAXIMUM_SUBTITLE_BLOCKS_PER_MESSAGE
+                && value.blocks.every(isContainerSubtitleBlock);
         case 'timing-trace':
             return Array.isArray(value.events)
                 && value.events.length > 0

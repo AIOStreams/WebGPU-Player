@@ -1769,6 +1769,9 @@ export default class CustomPlaybackController {
         }
 
         switch (event.type) {
+            case 'subtitle-blocks':
+                this.emitEvent({ blocks: event.blocks, generation: event.generation, type: 'subtitle-blocks' });
+                break;
             case 'audio-ended':
                 this.handleAudioEnded(event.generation);
                 break;

@@ -15,6 +15,7 @@ import {
     type InputAudioTrack,
     type InputFormat,
     type InputVideoTrack,
+    type MatroskaOtherTrackBlock,
     type Source,
     type VideoCodec,
     type VideoSample
@@ -92,8 +93,10 @@ import {
     MAX_DECODED_AUDIO_CHANNELS,
     MAX_DECODED_AUDIO_SAMPLE_CREDITS,
     MAX_DECODED_RAW_FRAME_CREDITS,
+    MAXIMUM_SUBTITLE_BLOCKS_PER_MESSAGE,
     MAXIMUM_VIDEO_STARTUP_PROGRESS_PACKET_COUNT,
     SOURCE_PROGRESS_REPORT_BYTE_COUNT,
+    type ContainerSubtitleBlock,
     type CustomDecodeAudioMetadataLayout,
     type CustomDecodeAudioOutputMode,
     type CustomDecodeDolbyVisionProfile,
@@ -475,6 +478,36 @@ let sourcePrefetchHolder: Readonly<{ prefetchId: number }> | null = null;
 
 function postResponse(response: DecodeWorkerResponse, transfer?: Transferable[]): void {
     workerScope.postMessage(response, transfer);
+}
+
+/** Posts the blocks of tracks the run doesn't play in one message per parse, each in a buffer of its own to transfer. */
+function collectSubtitleBlocks(run: DecodeRun): (block: MatroskaOtherTrackBlock) => void {
+    let pending: ContainerSubtitleBlock[] = [];
+    const flush = (): void => {
+        const blocks = pending;
+        pending = [];
+        if (run.cancelled) {
+            return;
+        }
+        for (let start = 0; start < blocks.length; start += MAXIMUM_SUBTITLE_BLOCKS_PER_MESSAGE) {
+            const batch = blocks.slice(start, start + MAXIMUM_SUBTITLE_BLOCKS_PER_MESSAGE);
+            postResponse(
+                { blocks: batch, generation: run.generation, type: 'subtitle-blocks' },
+                batch.map((block) => block.data.buffer)
+            );
+        }
+    };
+    return (block): void => {
+        if (pending.length === 0) {
+            queueMicrotask(flush);
+        }
+        pending.push({
+            data: block.data.slice(),
+            durationMs: block.duration === null ? null : block.duration * 1000,
+            timestampMs: block.timestamp * 1000,
+            trackNumber: block.trackNumber
+        });
+    };
 }
 
 /** Posts the initial video attempt's startup progress, at the playback time of the packet the attempt reached. */
@@ -4332,7 +4365,11 @@ async function decodeMedia(run: DecodeRun, request: Extract<DecodeWorkerRequest,
             return;
         }
         const source = openMediaSource(run, request.source);
-        const input = new Input({ formats: ALL_FORMATS, source });
+        const input = new Input({
+            formats: ALL_FORMATS,
+            formatOptions: { matroska: { onOtherTrackBlock: collectSubtitleBlocks(run) } },
+            source
+        });
         run.input = input;
         const stopReportingSourceReads = reportPreparationSourceReads(run, source);
         let prepared: PreparedRunTracks | null;

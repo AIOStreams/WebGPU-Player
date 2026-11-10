@@ -1,0 +1,159 @@
+diff --git a/src/index.ts b/src/index.ts
+index c4f9b77..0ba1090 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -223,6 +223,8 @@ export {
+ 	FlacInputFormat,
+ 	IsobmffInputFormat,
+ 	type IsobmffInputFormatOptions,
++	type MatroskaInputFormatOptions,
++	type MatroskaOtherTrackBlock,
+ 	HlsInputFormat,
+ 	type HlsInputFormatOptions,
+ 	MatroskaInputFormat,
+diff --git a/src/input-format.ts b/src/input-format.ts
+index fdedaae..79599c3 100644
+--- a/src/input-format.ts
++++ b/src/input-format.ts
+@@ -1060,6 +1060,33 @@ export type InputFormatOptions = {
+ 	isobmff?: IsobmffInputFormatOptions;
+ 	/** HLS-specific configuration. */
+ 	hls?: HlsInputFormatOptions;
++	/** Matroska-specific configuration. */
++	matroska?: MatroskaInputFormatOptions;
++};
++
++/**
++ * A block of a Matroska track that the input doesn't read, such as a subtitle track.
++ * @group Input formats
++ * @public
++ */
++export type MatroskaOtherTrackBlock = {
++	trackNumber: number;
++	/** In seconds. */
++	timestamp: number;
++	/** In seconds, or null where the block has none. */
++	duration: number | null;
++	/** As stored, before any content encoding is undone. */
++	data: Uint8Array;
++};
++
++/**
++ * Additional Matroska input configuration.
++ * @group Input formats
++ * @public
++ */
++export type MatroskaInputFormatOptions = {
++	/** Called with each block of a track the input doesn't read, as its cluster is parsed, again if it's parsed again. */
++	onOtherTrackBlock?: (block: MatroskaOtherTrackBlock) => void;
+ };
+ 
+ /**
+diff --git a/src/matroska/matroska-demuxer.ts b/src/matroska/matroska-demuxer.ts
+index 5fdc170..b003dcc 100644
+--- a/src/matroska/matroska-demuxer.ts
++++ b/src/matroska/matroska-demuxer.ts
+@@ -144,6 +144,14 @@ type SeekEntry = {
+ 	segmentPosition: number;
+ };
+ 
++type OtherTrackBlock = {
++	cluster: Cluster;
++	trackNumber: number;
++	relativeTimestamp: number;
++	duration: number | null;
++	data: Uint8Array;
++};
++
+ type Cluster = {
+ 	segment: Segment;
+ 	elementStartPos: number;
+@@ -339,6 +347,7 @@ export class MatroskaDemuxer extends Demuxer {
+ 	currentTrack: InternalTrack | null = null;
+ 	currentCluster: Cluster | null = null;
+ 	currentBlock: ClusterBlock | null = null;
++	currentOtherBlock: OtherTrackBlock | null = null;
+ 	currentBlockAdditional: {
+ 		addId: number;
+ 		data: Uint8Array | null;
+@@ -973,6 +982,31 @@ export class MatroskaDemuxer extends Demuxer {
+ 		return res.set(cluster);
+ 	}
+ 
++	/** A block of a track no input track reads, while a format option asks for them. */
++	readOtherTrackBlock(trackNumber: number, blockSlice: FileSlice): OtherTrackBlock | null {
++		if (!this.input._formatOptions.matroska?.onOtherTrackBlock || !this.currentCluster) return null;
++
++		const relativeTimestamp = readI16Be(blockSlice);
++		readU8(blockSlice); // Flags
++		return {
++			cluster: this.currentCluster,
++			trackNumber,
++			relativeTimestamp,
++			duration: null,
++			data: readBytes(blockSlice, blockSlice.remainingLength),
++		};
++	}
++
++	reportOtherTrackBlock(block: OtherTrackBlock) {
++		const factor = block.cluster.segment.timestampFactor;
++		this.input._formatOptions.matroska?.onOtherTrackBlock?.({
++			trackNumber: block.trackNumber,
++			timestamp: (block.cluster.timestamp + block.relativeTimestamp) / factor,
++			duration: block.duration === null ? null : block.duration / factor,
++			data: block.data,
++		});
++	}
++
+ 	getTrackDataInCluster(cluster: Cluster, trackNumber: number) {
+ 		let trackData = cluster.trackData.get(trackNumber);
+ 		if (!trackData) {
+@@ -1865,7 +1899,12 @@ export class MatroskaDemuxer extends Demuxer {
+ 				if (trackNumber === null || blockSlice.remainingLength < 3) break;
+ 
+ 				const trackData = this.getTrackDataInCluster(this.currentCluster, trackNumber);
+-				if (!trackData) break; // Not a track we care about
++				if (!trackData) {
++					// Not a track we care about
++					const other = this.readOtherTrackBlock(trackNumber, blockSlice);
++					if (other) this.reportOtherTrackBlock(other);
++					break;
++				}
+ 
+ 				const relativeTimestamp = readI16Be(blockSlice);
+ 
+@@ -1907,6 +1946,10 @@ export class MatroskaDemuxer extends Demuxer {
+ 				this.readContiguousElements(slice.slice(dataStartPos, size));
+ 
+ 				this.currentBlock = null;
++				if (this.currentOtherBlock) {
++					this.reportOtherTrackBlock(this.currentOtherBlock);
++					this.currentOtherBlock = null;
++				}
+ 			}; break;
+ 
+ 			case EBMLId.Block: {
+@@ -1918,7 +1961,11 @@ export class MatroskaDemuxer extends Demuxer {
+ 				if (trackNumber === null || blockSlice.remainingLength < 3) break;
+ 
+ 				const trackData = this.getTrackDataInCluster(this.currentCluster, trackNumber);
+-				if (!trackData) break;
++				if (!trackData) {
++					// Its BlockDuration follows, so the group reports it
++					this.currentOtherBlock = this.readOtherTrackBlock(trackNumber, blockSlice);
++					break;
++				}
+ 
+ 				const relativeTimestamp = readI16Be(blockSlice);
+ 
+@@ -1983,6 +2030,10 @@ export class MatroskaDemuxer extends Demuxer {
+ 			}; break;
+ 
+ 			case EBMLId.BlockDuration: {
++				if (this.currentOtherBlock) {
++					this.currentOtherBlock.duration = readUnsignedInt(slice, size);
++					break;
++				}
+ 				if (!this.currentBlock) break;
+ 
+ 				this.currentBlock.duration = readUnsignedInt(slice, size);
