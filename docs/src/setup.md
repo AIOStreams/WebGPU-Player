@@ -27,7 +27,8 @@
    ```
 
    Nothing installs it from npm: `tsconfig.json` maps `mediabunny` to the folder, and `node scripts/mediabunny.mjs` builds its `dist/` with the fork's own pinned toolchain.
-   The typecheck, test, lint, and build scripts run that step first and skip it while `dist/webgpu-player-build.json` names the checked-out commit; `--force` rebuilds.
+   The step first applies each patch in `patches/mediabunny/` that the checkout lacks.
+   The typecheck, test, lint, and build scripts run that step first and skip it while `dist/webgpu-player-build.json` names the checked-out commit and the patches; `--force` rebuilds.
    See [Decisions](decisions.md#repository) for why it is a fork, and which pull requests it merges.
 3. Fetch the decoder projects and the pass projects, which are repositories of their own checked out at `wgpud/` and `wgpup/`, and install their pinned releases:
 
