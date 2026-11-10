@@ -44,6 +44,7 @@ Read the engine's folders from `tools/constants.json` (`sourceDirectory`, `scrip
 
 A host that plays URLs with no server-side probe of the file can import one served module instead of the sources.
 `EmbeddedPlayer` describes the source in the page with Mediabunny, runs the eligibility, and drives the presenter, controller, and frame loop behind `open`, `play`, `pause`, `seek`, and `setAudio`.
+`setPasses` hands the presenter pass files (see [Create a new WebGPU pass](new-pass.md)), as `setPresentationPreset` does, and `stats` names the passes the current plan runs.
 A source it has no route for, or a route that falls back, comes back to the host as a reason and a position, for the host's own player.
 
 1. Build the served assets, then the module: `node <engine>/scripts/build-embed.mjs` after `node <engine>/scripts/build.mjs`.

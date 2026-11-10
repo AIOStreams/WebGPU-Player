@@ -43,7 +43,8 @@ import {
     type PresentationInput
 } from '../presentation/PresentationSetup';
 import { createHDRToSDRRenderSettings, HDR_RENDER_SETTING_RANGES } from '../presentation/RenderSettings';
-import WebGPUPresenter, { type PresentationFallbackReason, type PresentationSurface } from '../presentation/WebGPUPresenter';
+import type { PlanReport } from '../presentation/passes/PassTypes';
+import WebGPUPresenter, { type PresentationFallbackReason, type PresentationPresetFile, type PresentationSurface } from '../presentation/WebGPUPresenter';
 import canvasStyles from '../style.css';
 import { requireMicroseconds } from '../TimeMath';
 import { describeSource, type DescribedSource, type DescribedStream } from './DescribeSource';
@@ -118,6 +119,8 @@ export type EmbeddedStats = Readonly<{
     audioUnderflows: number
     framesPresented: number
     framesDropped: number
+    /** The passes the current plan runs. */
+    passes: readonly string[]
     framesLate: number
     videoAheadMs: number | null
     audioAheadMs: number | null
@@ -133,6 +136,8 @@ export type EmbeddedPlayer = Readonly<{
     setVolume(volume: number): void
     setMuted(muted: boolean): void
     setRate(rate: number): void
+    /** Pass files in the presenter's `//!` format, run in order wherever their conditions hold; they outlive routes. */
+    setPasses(sources: readonly string[]): Promise<PlanReport>
     /** Restarts the route at the clock. */
     setAudio(ordinal: number): Promise<EmbeddedOpenResult>
     /** Null before a frame shows. */
@@ -688,6 +693,9 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             muted = next;
             opened?.route?.controller?.setMuted(next);
         },
+        setPasses: (sources: readonly string[]): Promise<PlanReport> => presenter.setPresentationPreset(
+            sources.map((source: string): PresentationPresetFile => ({ parameters: {}, source }))
+        ),
         setRate: (next: number): void => {
             rate = next;
             const route = opened?.route;
@@ -727,6 +735,7 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
                 framesDropped: telemetry.videoDecode.droppedFrameCount,
                 framesLate: telemetry.presentationTiming.lateFrameCount,
                 framesPresented: presentation.presentedFrameCount,
+                passes: presenter.getPresentationPlanReport().activePasses,
                 presentedMs: presentation.lastPresentedMediaTimeMicroseconds === null ? null : toMilliseconds(presentation.lastPresentedMediaTimeMicroseconds),
                 route: describeRoute(eligibility),
                 toneMapped: presentation.mode === 'hdr-to-sdr',
