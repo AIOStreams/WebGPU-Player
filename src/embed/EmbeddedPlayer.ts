@@ -507,6 +507,18 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
     };
     document.addEventListener('visibilitychange', onVisibility);
 
+    // Static HDR and a Dolby Vision base take the browser's decoder only once its probe has authorized the route
+    const waitForStaticHDRRoutes = async (input: PresentationInput): Promise<void> => {
+        const metadata = input.colorMetadata ?? input.dolbyVisionBaseColorMetadata;
+        if (metadata === null || metadata.transfer === 'sdr') {
+            return;
+        }
+        await presenter.waitForExternalHDRAuthorizationPrewarm();
+        if (presenter.getAuthorizedExternalHDRRouteKeys().length === 0) {
+            await presenter.waitForRawHDRAuthorizationPrewarm();
+        }
+    };
+
     /** Throws RouteRefused when the engine has no route for the source. */
     const chooseRoute = async (
         current: Opened,
@@ -537,7 +549,8 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
         const [ capabilities, nativeMediaAudioCapabilities, packages ] = await Promise.all([
             probeCustomDecodeCapabilities(mediaSource),
             probeCachedNativeMediaAudioCapabilities(),
-            packagesFor(current.source)
+            packagesFor(current.source),
+            waitForStaticHDRRoutes(input)
         ]);
         ensureLive();
         const presentationOptions = await getCustomPresentationEligibilityOptions(presenter, {
