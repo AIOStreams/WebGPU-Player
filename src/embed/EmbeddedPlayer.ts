@@ -8,7 +8,11 @@ import { createBrowserCustomAudioOutputFactory } from '../audio/output/BrowserCu
 import { getWebGPUAudioOutputManager } from '../audio/output/WebGPUAudioOutputManager';
 import { createDefaultAudioDownmixSettings } from '../audio/processing/CustomAudioDownmix';
 import { DEFAULT_CUSTOM_AUDIO_DOWNMIX_ALGORITHM } from '../audio/processing/CustomAudioDownmixAlgorithm';
-import { probeCustomDecodeCapabilities } from '../capability/CustomDecodeCapabilities';
+import {
+    configureCustomDecodeCapabilityBackground,
+    probeCustomDecodeCapabilities,
+    warmCustomDecodeCapabilities
+} from '../capability/CustomDecodeCapabilities';
 import {
     getAudioMetadataLayout,
     getCustomPlaybackEligibility,
@@ -40,6 +44,7 @@ import {
     isWebGPUPresentationInput,
     precompileGPUVideoDecoder,
     readPresentationInput,
+    warmGPUVideoDecoders,
     type HDRRenderConfiguration,
     type PresentationInput
 } from '../presentation/PresentationSetup';
@@ -143,6 +148,10 @@ export type EmbeddedPlayer = Readonly<{
     setRate(rate: number): void
     /** Pass files in the presenter's `//!` format, run in order wherever their conditions hold; they outlive routes. */
     setPasses(sources: readonly string[]): Promise<PlanReport>
+    /** Presents HDR video as HDR on a screen that shows it, rather than tone-mapped; it outlives routes. */
+    setHDROutput(enabled: boolean): Promise<void>
+    /** The presented frames as a video stream, for picture-in-picture; null before a surface shows one. */
+    captureStream(): MediaStream | null
     /** Restarts the route at the clock. */
     setAudio(ordinal: number): Promise<EmbeddedOpenResult>
     /** Null before a frame shows. */
@@ -151,6 +160,35 @@ export type EmbeddedPlayer = Readonly<{
     stats(): EmbeddedStats | null
     destroy(): void
 }>;
+
+const WARM_VIDEO_PACKAGES = [ 'av1', 'hevc', 'jpeg2000', 'mpeg2', 'mpeg4', 'uncompressed', 'vc1' ];
+/** Downloaded to warm even when the browser holds no copy, as browsers most often lack HEVC; the rest warm only from its cache. */
+const ALWAYS_WARMED_PACKAGES = [ 'hevc' ];
+
+/** Runs the decoder tests while nothing plays, then compiles the GPU video decoders into the browser's shader cache; a constrained client does neither. Never rejects. */
+export async function warmUp(isPlaybackActive: () => boolean): Promise<void> {
+    try {
+        configureCustomDecodeCapabilityBackground({ isPlaybackActive });
+        if (!warmCustomDecodeCapabilities()) {
+            return;
+        }
+        const names = WARM_VIDEO_PACKAGES.filter((name: string): boolean => __WEBGPU_PLAYER_DECODER_PACKAGES__.includes(`${name}.wasm`));
+        const cached = await Promise.all(names.map(async (name: string): Promise<boolean> => (
+            ALWAYS_WARMED_PACKAGES.includes(name)
+            || (await fetch(packageURL(name), { cache: 'only-if-cached', mode: 'same-origin' }).catch((): null => null))?.ok === true
+        )));
+        const loaded = await Promise.all(names.filter((_name: string, index: number): boolean => cached[index]).map(loadPackage));
+        const video = loaded.filter((loadedPackage: LoadedPackage): loadedPackage is VideoDecoderPackage => loadedPackage?.kind === 'video');
+        const presenter = new WebGPUPresenter((): void => undefined, (): void => undefined);
+        try {
+            await warmGPUVideoDecoders(presenter, video);
+        } finally {
+            presenter.destroy();
+        }
+    } catch {
+        // A warm-up that fails leaves each playback to compile what it needs
+    }
+}
 
 /** Each source is still checked as it opens. */
 export function isEmbeddedPlayerSupported(): boolean {
@@ -192,11 +230,13 @@ const PACKAGE_OF_CODEC: Readonly<Record<string, string>> = {
 
 const loadedPackages = new Map<string, Promise<LoadedPackage>>();
 
+const packageURL = (name: string): URL => new URL(`../wgpud/${name}.wasm?v=${__WEBGPU_PLAYER_ASSET_KEY__}`, import.meta.url);
+
 /** Null for a package that fails to load. */
 function loadPackage(name: string): Promise<LoadedPackage> {
     let loading = loadedPackages.get(name);
     if (!loading) {
-        loading = fetch(new URL(`../wgpud/${name}.wasm?v=${__WEBGPU_PLAYER_ASSET_KEY__}`, import.meta.url))
+        loading = fetch(packageURL(name))
             .then(async (response: Response): Promise<LoadedPackage> => (response.ok ? loadDecoderPackage(await response.arrayBuffer()) : null))
             .catch((): null => null);
         loadedPackages.set(name, loading);
@@ -311,6 +351,8 @@ class RouteRefused extends Error {}
 export function createEmbeddedPlayer(surface: PresentationSurface, events: EmbeddedPlayerEvents): EmbeddedPlayer {
     let generation = 0;
     let opened: Opened | null = null;
+    /** Settles once every stopped route's controller has closed. */
+    let teardown: Promise<void> = Promise.resolve();
     let volume = 1;
     let muted = false;
     let rate = 1;
@@ -332,7 +374,10 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
         route.controller = null;
         presenter.endSession(advance());
         const atMs = controller ? toMilliseconds(controller.currentTimeMicroseconds) : 0;
-        void controller?.destroy();
+        if (controller) {
+            const destroyed = controller.destroy().catch((): void => undefined);
+            teardown = Promise.all([ teardown, destroyed ]).then((): void => undefined);
+        }
         route.audioPrewarm?.close().catch((): void => undefined);
         route.audioPrewarm = null;
         return atMs;
@@ -611,6 +656,11 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
         const route: Route = { audioPrewarm, controller: null, eligibility: null, frameLoop: null, input: null, lastError: null, options: null };
         current.route = route;
         try {
+            // The last route's decoders, workers and audio output close first
+            await teardown;
+            if (current.route !== route || opened !== current) {
+                throw new RouteRefused('superseded');
+            }
             const eligibility = await playRoute(current, route, advance(), startMs);
             const video = current.source.MediaStreams.find((stream: DescribedStream): boolean => stream.Type === 'Video');
             return {
@@ -701,6 +751,8 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             muted = next;
             opened?.route?.controller?.setMuted(next);
         },
+        captureStream: (): MediaStream | null => presenter.getCanvas()?.captureStream() ?? null,
+        setHDROutput: (enabled: boolean): Promise<void> => presenter.setHDROutputEnabled(enabled),
         setPasses: (sources: readonly string[]): Promise<PlanReport> => presenter.setPresentationPreset(
             sources.map((source: string): PresentationPresetFile => ({ parameters: {}, source }))
         ),

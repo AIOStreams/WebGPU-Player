@@ -1,6 +1,6 @@
 {
   "name": "@aiostreams/webgpu-player",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "WebGPU-Player's served assets with its embedding module, for a page that plays URLs without a media server",
   "license": "MIT AND LGPL-2.1-or-later AND BSD-2-Clause",
   "repository": {

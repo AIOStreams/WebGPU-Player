@@ -1642,6 +1642,11 @@ export default class WebGPUPresenter {
         return { ...this.telemetry };
     }
 
+    /** The canvas frames present to, once a surface is attached. */
+    getCanvas(): HTMLCanvasElement | null {
+        return this.canvas;
+    }
+
     /** Without copying the telemetry, for a host that reads it every frame. */
     getLastPresentedMediaTime(): Microseconds | null {
         return this.telemetry.lastPresentedMediaTimeMicroseconds;
