@@ -132,6 +132,8 @@ const RECOVERY_ERROR_LINES = [
     `//! error: ${CONCEALED_ERROR_CODE}, ${CONCEALED_ERROR_NAME}, conceal`,
     `//! error: ${RESYNCED_ERROR_CODE}, ${RESYNCED_ERROR_NAME}, resync`
 ];
+// The recoverable codes in rising severity, conceal before drop before resync
+const RECOVERABLE_ERROR_CODES = [ CONCEALED_ERROR_CODE, DROPPED_ERROR_CODE, RESYNCED_ERROR_CODE ];
 const ERROR_CODE_SHIFT = 24;
 const FAILING_VALUE = 1004;
 // A parser failure that lost a picture, as the decode worker reports it on its first held packet
@@ -424,7 +426,10 @@ function createErrorWord(code: number, value: number = FAILING_VALUE): number {
     return ((code << ERROR_CODE_SHIFT) | value) >>> 0;
 }
 
-/** Plays a decoder's reportDecodeError: a code the test header declares recoverable keeps the picture's most severe word, any other is fatal. */
+/**
+ * Plays a decoder's reportDecodeError: a code the test header declares recoverable keeps the picture's most severe word, with the code's place in
+ * rising severity plus one in place of the code; any other is fatal.
+ */
 function reportDecoderError(dispatch: MockDispatch, errorWord: number): void {
     const code = errorWord >>> ERROR_CODE_SHIFT;
     if (code === FATAL_ERROR_CODE) {
@@ -432,7 +437,8 @@ function reportDecoderError(dispatch: MockDispatch, errorWord: number): void {
         return;
     }
     const status = getBoundBuffer(dispatch, GPU_DECODER_BINDINGS.status);
-    status.writeWords(STATUS_PICTURE_ERROR_WORD * BYTES_PER_WORD, [ errorWord ]);
+    const place = RECOVERABLE_ERROR_CODES.indexOf(code) + 1;
+    status.writeWords(STATUS_PICTURE_ERROR_WORD * BYTES_PER_WORD, [ ((place << ERROR_CODE_SHIFT) | (errorWord & ((1 << ERROR_CODE_SHIFT) - 1))) >>> 0 ]);
 }
 
 /** Returns timestamps of frame indices, in frame durations. */

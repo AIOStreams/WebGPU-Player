@@ -72,6 +72,7 @@ export const GPU_DECODER_STATUS_PACKET_BLOCK_BYTE_LENGTH = GPU_DECODER_STATUS_BY
 
 /** The rank the prelude gives a fatal error; each recovery ranks its position in GPU_DECODER_ERROR_RECOVERIES plus one. */
 const FATAL_RECOVERY_RANK = 0;
+const PICTURE_ERROR_VALUE_MASK = (1 << GPU_DECODER_ERROR_CODE_SHIFT) - 1;
 
 // Word indices of GPUDecodePacket
 const PACKET_BYTE_OFFSET_WORD = 0;
@@ -114,6 +115,7 @@ const CHROMA_FORMAT_422 = 2;
 const CHROMA_FORMAT_444 = 3;
 const PRELUDE_HELPER_NAMES = [
     'getDecodeErrorRecovery',
+    'getPictureErrorOrder',
     'getSampleByteAddress',
     'readConfigByte',
     'readOutputSample',
@@ -201,25 +203,15 @@ fn readConfigByte(byteIndex: u32) -> u32 {
 
 const STATUS_FIXED_HELPERS_WGSL = `// Reports an error word, (code << ${GPU_DECODER_ERROR_CODE_SHIFT}) | value. A code the header declares recoverable marks the packet's picture,
 // which keeps its most severe word, by recovery and then by word; any other ends the attempt once the engine reads the status back, the highest word winning
+// The picture's word carries the code's place in that order, so atomicMax keeps it: WebKit's Metal translation of a compare-exchange fails on some devices
 fn reportDecodeError(word: u32) {
     let errorWord = max(word, 1u);
-    let recovery = getDecodeErrorRecovery(errorWord >> ${GPU_DECODER_ERROR_CODE_SHIFT}u);
-    if (recovery == ${RECOVERY_RANK_CONSTANT_NAMES.fatal}) {
+    let code = errorWord >> ${GPU_DECODER_ERROR_CODE_SHIFT}u;
+    if (getDecodeErrorRecovery(code) == ${RECOVERY_RANK_CONSTANT_NAMES.fatal}) {
         atomicMax(&status.errorCode, errorWord);
         return;
     }
-    var current = atomicLoad(&status.pictureError);
-    loop {
-        let currentRecovery = getDecodeErrorRecovery(current >> ${GPU_DECODER_ERROR_CODE_SHIFT}u);
-        if (current != 0u && (currentRecovery > recovery || (currentRecovery == recovery && current >= errorWord))) {
-            return;
-        }
-        let exchange = atomicCompareExchangeWeak(&status.pictureError, current, errorWord);
-        if (exchange.exchanged) {
-            return;
-        }
-        current = exchange.old_value;
-    }
+    atomicMax(&status.pictureError, (getPictureErrorOrder(code) << ${GPU_DECODER_ERROR_CODE_SHIFT}u) | (errorWord & ${PICTURE_ERROR_VALUE_MASK}u));
 }
 
 // Hands a reference slot back to the engine; a decoder with references holds every output slot until it releases it
@@ -292,9 +284,44 @@ function createErrorRecoveryWGSL(errorRecoveries: ReadonlyMap<number, GPUDecoder
     return lines.join('\n');
 }
 
-/** Returns the status helpers of a decoder: its constants, its generated recovery lookup, and the fixed helpers. */
+/**
+ * Returns a decoder's recoverable codes in rising severity, by recovery and then by code.
+ * The picture's error word carries a code's place here plus one, which the engine maps back.
+ */
+export function getGPUDecoderPictureErrorCodes(errorRecoveries: ReadonlyMap<number, GPUDecoderErrorRecovery>): number[] {
+    return [ ...errorRecoveries ]
+        .sort(([ firstCode, firstRecovery ]: [ number, GPUDecoderErrorRecovery ], [ secondCode, secondRecovery ]: [ number, GPUDecoderErrorRecovery ]): number => (
+            getGPUDecoderErrorRecoveryRank(firstRecovery) - getGPUDecoderErrorRecoveryRank(secondRecovery) || firstCode - secondCode
+        ))
+        .map(([ code ]: [ number, GPUDecoderErrorRecovery ]): number => code);
+}
+
+/** Generates getPictureErrorOrder: a recoverable code's place in rising severity plus one, and 0 for any other code. */
+function createPictureErrorOrderWGSL(errorRecoveries: ReadonlyMap<number, GPUDecoderErrorRecovery>): string {
+    const lines: string[] = [ '// The place of a recoverable code in rising severity, which the picture\'s error word carries' ];
+    lines.push('fn getPictureErrorOrder(code: u32) -> u32 {');
+    lines.push('    switch (code) {');
+    getGPUDecoderPictureErrorCodes(errorRecoveries).forEach((code: number, index: number): void => {
+        lines.push(`        case ${code}u: {`);
+        lines.push(`            return ${index + 1}u;`);
+        lines.push('        }');
+    });
+    lines.push('        default: {');
+    lines.push('            return 0u;');
+    lines.push('        }');
+    lines.push('    }');
+    lines.push('}');
+    return lines.join('\n');
+}
+
+/** Returns the status helpers of a decoder: its constants, its generated recovery and order lookups, and the fixed helpers. */
 function createStatusHelpersWGSL(manifest: GPUDecoderManifest): string {
-    return [ createStatusConstantsWGSL(), createErrorRecoveryWGSL(manifest.errorRecoveries), STATUS_FIXED_HELPERS_WGSL ].join('\n\n');
+    return [
+        createStatusConstantsWGSL(),
+        createErrorRecoveryWGSL(manifest.errorRecoveries),
+        createPictureErrorOrderWGSL(manifest.errorRecoveries),
+        STATUS_FIXED_HELPERS_WGSL
+    ].join('\n\n');
 }
 
 /** The values of the per-packet uniform. */

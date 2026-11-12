@@ -65,7 +65,7 @@ const RECOVERY_ERROR_LINES = [
     `//! error: ${CONCEALED_ERROR_CODES[1]}, motionType, conceal`,
     `//! error: ${RESYNCED_ERROR_CODE}, bitsExhausted, resync`
 ];
-const STATUS_HELPER_NAMES = [ 'getDecodeErrorRecovery', 'reportDecodeError', 'reportPictureFields', 'releaseReferenceSlot', 'reportHeaderFacts' ];
+const STATUS_HELPER_NAMES = [ 'getDecodeErrorRecovery', 'getPictureErrorOrder', 'reportDecodeError', 'reportPictureFields', 'releaseReferenceSlot', 'reportHeaderFacts' ];
 const STATUS_CONSTANT_NAMES = [
     'DECODE_ERROR_RECOVERY_FATAL',
     'DECODE_ERROR_RECOVERY_CONCEAL',
@@ -280,8 +280,8 @@ describe('createGPUDecoderPrelude', () => {
 
         const helper = /fn reportDecodeError\(word: u32\) \{[\s\S]*?\n\}/.exec(prelude)?.[0] ?? '';
         expect(helper).toContain('atomicMax(&status.errorCode, errorWord);');
-        expect(helper).toContain('atomicCompareExchangeWeak(&status.pictureError, current, errorWord)');
-        expect(helper).toContain('currentRecovery > recovery || (currentRecovery == recovery && current >= errorWord)');
+        expect(helper).toContain('atomicMax(&status.pictureError, (getPictureErrorOrder(code) << 24u) | (errorWord & 16777215u));');
+        expect(prelude).not.toContain('atomicCompareExchangeWeak');
     });
 
     it('declares the picture fields bits the decoders and parsers share', () => {

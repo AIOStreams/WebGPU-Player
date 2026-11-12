@@ -35,6 +35,7 @@ import {
     GPU_DECODER_STATUS_PACKET_BLOCK_BYTE_LENGTH,
     GPU_DECODER_STATUS_PACKET_BLOCK_BYTE_OFFSET,
     GPU_DECODER_STREAM_UNIFORM_BYTE_LENGTH,
+    getGPUDecoderPictureErrorCodes,
     readGPUDecoderStatus,
     writeGPUDecoderPacketUniform,
     writeGPUDecoderStreamUniform
@@ -514,6 +515,7 @@ export default class GPUVideoDecodeSession {
     // Frames whose output a parser has not decided yet, in decode order
     private readonly parserFrames: DecodedFrameEntry[] = [];
     private readonly parserOutput: boolean;
+    private readonly pictureErrorCodes: readonly number[];
     private headerFacts: GPUDecodeStreamFacts | null = null;
     private readonly inFlightReadbacks = new Set<Promise<void>>();
     // The completion of each submitted slice whose work may still run
@@ -554,6 +556,7 @@ export default class GPUVideoDecodeSession {
         this.format = format;
         this.manifest = manifest;
         this.parserOutput = manifest.parser !== null;
+        this.pictureErrorCodes = getGPUDecoderPictureErrorCodes(manifest.errorRecoveries);
         this.slicing = options.slicing ?? false;
         // The pool goes first: it is the one allocation a device's limits can refuse
         this.pool = new GPUFramePool(
@@ -1526,10 +1529,10 @@ export default class GPUVideoDecodeSession {
      * the concealed picture presents, the picture drops, or a resync begins at it.
      */
     private applyPictureError(entry: DecodedFrameEntry, errorWord: number): void {
-        const code = errorWord >>> GPU_DECODER_ERROR_CODE_SHIFT;
-        const recovery = this.manifest.errorRecoveries.get(code);
+        const code = this.pictureErrorCodes[(errorWord >>> GPU_DECODER_ERROR_CODE_SHIFT) - 1];
+        const recovery = code === undefined ? undefined : this.manifest.errorRecoveries.get(code);
         // The prelude reports only recoverable codes in the picture's word, so another code ends the attempt as a fatal one does
-        if (recovery === undefined) {
+        if (code === undefined || recovery === undefined) {
             this.fail({ code: 'decoder-error', detail: String(errorWord) });
             return;
         }
