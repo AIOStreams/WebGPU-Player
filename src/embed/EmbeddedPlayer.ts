@@ -50,7 +50,7 @@ import {
 } from '../presentation/PresentationSetup';
 import { createHDRToSDRRenderSettings, HDR_RENDER_SETTING_RANGES } from '../presentation/RenderSettings';
 import type { PlanReport } from '../presentation/passes/PassTypes';
-import WebGPUPresenter, { type PresentationFallbackReason, type PresentationPresetFile, type PresentationSurface } from '../presentation/WebGPUPresenter';
+import WebGPUPresenter, { type PresentationFallbackReason, type PresentationPresetFile, type PresentationSurface, type PresentedPicture } from '../presentation/WebGPUPresenter';
 import canvasStyles from '../style.css';
 import { requireMicroseconds } from '../TimeMath';
 import { describeSource, type DescribedSource, type DescribedStream } from './DescribeSource';
@@ -138,6 +138,11 @@ export type EmbeddedStats = Readonly<{
     presentedMs: number | null
 }>;
 
+export type EmbeddedPictureStream = Readonly<{
+    stream: MediaStream
+    stop(): void
+}>;
+
 export type EmbeddedPlayer = Readonly<{
     open(request: EmbeddedOpenRequest): Promise<EmbeddedOpenResult>
     play(): void
@@ -150,8 +155,10 @@ export type EmbeddedPlayer = Readonly<{
     setPasses(sources: readonly string[]): Promise<PlanReport>
     /** Presents HDR video as HDR on a screen that shows it, rather than tone-mapped; it outlives routes. */
     setHDROutput(enabled: boolean): Promise<void>
-    /** The presented frames as a video stream, for picture-in-picture; null before a surface shows one. */
-    captureStream(): MediaStream | null
+    /** The drawn pictures without their bars, at most 1920 on the longer side; a paused playback draws its frame again for it. */
+    pictureStream(onPicture?: () => void): EmbeddedPictureStream | null
+    /** While a window shows the playback, a hidden page the browser still paints for it keeps presenting. */
+    setPictureInPicture(open: boolean): void
     /** Restarts the route at the clock. */
     setAudio(ordinal: number): Promise<EmbeddedOpenResult>
     /** Null before a frame shows. */
@@ -199,6 +206,10 @@ function isPageVisible(): boolean {
     // eslint-disable-next-line compat/compat -- WebGPU playback is capability-gated
     return !(typeof document !== 'undefined' && document.visibilityState === HIDDEN_DOCUMENT_STATE);
 }
+
+const MAXIMUM_PICTURE_DIMENSION = 1920;
+const PLACEHOLDER_WIDTH = 16;
+const PLACEHOLDER_HEIGHT = 9;
 
 const toMilliseconds = (time: Microseconds | number): number => time / MICROSECONDS_PER_MILLISECOND;
 const toMicroseconds = (ms: number): Microseconds => requireMicroseconds(Math.max(0, Math.round(ms * MICROSECONDS_PER_MILLISECOND)));
@@ -502,8 +513,26 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
 
     const presenter = new WebGPUPresenter(handlePresentationFallback, handleDecodedRefresh);
     const gpuVideoDecodeSessionFactory = createGPUVideoDecodeSessionFactory(presenter, { slicing: false });
+    let pictureInPicture = false;
+    let paintedWhileHidden = false;
+    let hiddenPaint: number | null = null;
+    const presentsAsVisible = (): boolean => isPageVisible() || (pictureInPicture && paintedWhileHidden);
     const onVisibility = (): void => {
-        opened?.route?.frameLoop?.synchronizePageVisibility(isPageVisible());
+        paintedWhileHidden = false;
+        if (hiddenPaint !== null) {
+            cancelAnimationFrame(hiddenPaint);
+            hiddenPaint = null;
+        }
+        if (pictureInPicture && !isPageVisible()) {
+            hiddenPaint = requestAnimationFrame((): void => {
+                hiddenPaint = null;
+                if (pictureInPicture && !isPageVisible()) {
+                    paintedWhileHidden = true;
+                    opened?.route?.frameLoop?.synchronizePageVisibility(true);
+                }
+            });
+        }
+        opened?.route?.frameLoop?.synchronizePageVisibility(presentsAsVisible());
     };
     document.addEventListener('visibilitychange', onVisibility);
 
@@ -649,7 +678,7 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             presentationGeneration: routeGeneration
         });
         route.frameLoop = frameLoop;
-        frameLoop.synchronizePageVisibility(isPageVisible());
+        frameLoop.synchronizePageVisibility(presentsAsVisible());
         events.onState('loading');
         const result = await controller.play(createPlayOptions(eligibility, toMicroseconds(startMs), decodedAudio, target));
         if (!isCurrent(route, controller)) {
@@ -705,6 +734,8 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
     return {
         destroy: (): void => {
             stop();
+            pictureInPicture = false;
+            onVisibility();
             document.removeEventListener('visibilitychange', onVisibility);
             presenter.destroy();
         },
@@ -764,7 +795,49 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             muted = next;
             opened?.route?.controller?.setMuted(next);
         },
-        captureStream: (): MediaStream | null => presenter.getCanvas()?.captureStream() ?? null,
+        pictureStream: (onPicture?: () => void): EmbeddedPictureStream | null => {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d', { alpha: false });
+            if (!context || typeof canvas.captureStream !== 'function') {
+                return null;
+            }
+            canvas.width = PLACEHOLDER_WIDTH;
+            canvas.height = PLACEHOLDER_HEIGHT;
+            const stream = canvas.captureStream();
+            // Drawn after the stream starts, so its video has a first frame
+            context.fillRect(0, 0, PLACEHOLDER_WIDTH, PLACEHOLDER_HEIGHT);
+            const stopCopies = presenter.setPresentedPictureObserver((picture: PresentedPicture): void => {
+                if (picture.width < 1 || picture.height < 1) {
+                    return;
+                }
+                const scale = Math.min(1, MAXIMUM_PICTURE_DIMENSION / Math.max(picture.width, picture.height));
+                const width = Math.max(1, Math.round(picture.width * scale));
+                const height = Math.max(1, Math.round(picture.height * scale));
+                if (canvas.width !== width || canvas.height !== height) {
+                    canvas.width = width;
+                    canvas.height = height;
+                }
+                context.drawImage(picture.canvas, picture.x, picture.y, picture.width, picture.height, 0, 0, width, height);
+                onPicture?.();
+            });
+            handleDecodedRefresh(generation);
+            return {
+                stop: (): void => {
+                    stopCopies();
+                    for (const track of stream.getTracks()) {
+                        track.stop();
+                    }
+                },
+                stream
+            };
+        },
+        setPictureInPicture: (open: boolean): void => {
+            if (pictureInPicture === open) {
+                return;
+            }
+            pictureInPicture = open;
+            onVisibility();
+        },
         setHDROutput: (enabled: boolean): Promise<void> => presenter.setHDROutputEnabled(enabled),
         setPasses: (sources: readonly string[]): Promise<PlanReport> => presenter.setPresentationPreset(
             sources.map((source: string): PresentationPresetFile => ({ parameters: {}, source }))

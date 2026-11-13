@@ -46,7 +46,9 @@ A host that plays URLs with no server-side probe of the file can import one serv
 `EmbeddedPlayer` describes the source in the page with Mediabunny, runs the eligibility, and drives the presenter, controller, and frame loop behind `open`, `play`, `pause`, `seek`, and `setAudio`.
 `setPasses` hands the presenter pass files (see [Create a new WebGPU pass](new-pass.md)), as `setPresentationPreset` does, and `stats` names the passes the current plan runs.
 A source it has no route for, or a route that falls back, comes back to the host as a reason and a position, for the host's own player.
-`setHDROutput` presents HDR video as HDR on a screen that shows it, and `captureStream` gives the presented frames as a video stream, as for picture-in-picture, since the engine's `<video>` plays nothing.
+`setHDROutput` presents HDR video as HDR on a screen that shows it.
+`pictureStream` gives a video stream of each picture the presenter draws, copied through `setPresentedPictureObserver` without the bars around it and at most 1920 on its longer side, for a picture-in-picture window, since the engine's `<video>` plays nothing; a paused playback draws its frame again for it.
+`setPictureInPicture` says a picture-in-picture window shows the playback, the host's own or the stream's: while it is open, a hidden page on which an animation frame still runs, as Chromium paints a hidden page for a window, keeps presenting rather than draining video.
 `warmUp` runs the decoder tests while the page idles and nothing plays, then compiles the GPU video decoders the browser holds, and HEVC's, into its shader cache, so the first playback waits on neither; a constrained client skips it.
 A route starts once the last route's controller has closed.
 The optional `onSubtitleBlocks` event hands the host a Matroska file's blocks of the tracks the engine doesn't play, such as its subtitles, as the worker parses their clusters, so a host draws subtitles without reading the file again; a cluster parsed again sends its blocks again.
