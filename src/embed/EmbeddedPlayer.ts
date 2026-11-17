@@ -362,6 +362,9 @@ class RouteRefused extends Error {}
 export function createEmbeddedPlayer(surface: PresentationSurface, events: EmbeddedPlayerEvents): EmbeddedPlayer {
     let generation = 0;
     let opened: Opened | null = null;
+    /** Advances on every stop, so an open that outlived one stops before it plays. */
+    let opening = 0;
+    let destroyed = false;
     /** Settles once every stopped route's controller has closed. */
     let teardown: Promise<void> = Promise.resolve();
     let volume = 1;
@@ -725,6 +728,7 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
     };
 
     const stop = (): void => {
+        opening++;
         if (opened?.route) {
             stopRoute(opened.route);
         }
@@ -733,6 +737,7 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
 
     return {
         destroy: (): void => {
+            destroyed = true;
             stop();
             pictureInPicture = false;
             onVisibility();
@@ -740,9 +745,13 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             presenter.destroy();
         },
         open: async (request: EmbeddedOpenRequest): Promise<EmbeddedOpenResult> => {
+            if (destroyed) {
+                return { eligible: false, reason: 'destroyed' };
+            }
             // Before the first await, while the page's activation still holds
             const audioPrewarm = prewarmBrowserAudioContext(CUSTOM_AUDIO_OUTPUT_SAMPLE_RATE);
             stop();
+            const ours = opening;
             volume = request.volume;
             muted = request.muted;
             rate = request.rate;
@@ -752,6 +761,10 @@ export function createEmbeddedPlayer(surface: PresentationSurface, events: Embed
             } catch (error) {
                 audioPrewarm.close().catch((): void => undefined);
                 return { eligible: false, reason: error instanceof Error ? error.message : String(error) };
+            }
+            if (ours !== opening) {
+                audioPrewarm.close().catch((): void => undefined);
+                return { eligible: false, reason: 'superseded' };
             }
             const audio = audioTracksOf(source);
             const audioOrdinal = request.audioOrdinal ?? audio.find((track: EmbeddedAudioTrack): boolean => track.isDefault)?.ordinal ?? (audio.length ? 0 : null);

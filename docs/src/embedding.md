@@ -51,6 +51,7 @@ A source it has no route for, or a route that falls back, comes back to the host
 `setPictureInPicture` says a picture-in-picture window shows the playback, the host's own or the stream's: while it is open, a hidden page on which an animation frame still runs, as Chromium paints a hidden page for a window, keeps presenting rather than draining video.
 `warmUp` runs the decoder tests while the page idles and nothing plays, then compiles the GPU video decoders the browser holds, and HEVC's, into its shader cache, so the first playback waits on neither; a constrained client skips it.
 A route starts once the last route's controller has closed.
+An `open` that a `destroy` or a later `open` overtakes resolves as `superseded` without playing.
 The optional `onSubtitleBlocks` event hands the host a Matroska file's blocks of the tracks the engine doesn't play, such as its subtitles, as the worker parses their clusters, so a host draws subtitles without reading the file again; a cluster parsed again sends its blocks again.
 
 1. Build the served assets, then the module: `node <engine>/scripts/build-embed.mjs` after `node <engine>/scripts/build.mjs`.
