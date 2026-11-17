@@ -369,9 +369,10 @@ export function createExternalHDRShaderSignature(
 
 function frameMatchesAuthorizationContract(frame: VideoFrame, vector: ExternalHDRAuthorizationVector): boolean {
     const visibleRectangle = frame.visibleRect;
+    // A decoder may report the cropped size as the coded size
     return frame.format === null
-        && frame.codedWidth === vector.codedWidth
-        && frame.codedHeight === vector.codedHeight
+        && (frame.codedWidth === vector.codedWidth || frame.codedWidth === vector.displayWidth)
+        && (frame.codedHeight === vector.codedHeight || frame.codedHeight === vector.displayHeight)
         && frame.displayWidth === vector.displayWidth
         && frame.displayHeight === vector.displayHeight
         && frame.timestamp === 0
