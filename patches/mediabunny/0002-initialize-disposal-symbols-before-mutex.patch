@@ -1,0 +1,11 @@
+diff --git a/src/misc.ts b/src/misc.ts
+--- a/src/misc.ts
++++ b/src/misc.ts
+@@ -1228,3 +1228,6 @@
+ };
+-
++
++// Computed method names bind when the class is defined, before modules importing this file run.
++polyfillSymbolDispose();
++
+ export const isNumber = (x: unknown) => {

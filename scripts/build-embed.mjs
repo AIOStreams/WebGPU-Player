@@ -3,7 +3,8 @@
 // Usage: node scripts/build-embed.mjs [--production]
 
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 
 import { build } from 'esbuild';
 
@@ -31,14 +32,20 @@ await build({
         __WEBGPU_PLAYER_ASSET_KEY__: JSON.stringify(assetKey),
         __WEBGPU_PLAYER_DECODER_PACKAGES__: JSON.stringify(packages)
     },
-    entryPoints: [ join(SOURCE_DIRECTORY, 'embed', 'EmbeddedPlayer.ts') ],
+    entryPoints: [ 'EmbeddedPlayer', 'NativeDtsPlayback' ].map(name => join(SOURCE_DIRECTORY, 'embed', name + '.ts')),
+    alias: { mediabunny: join(ENGINE_ROOT, 'vendor', 'mediabunny', 'dist', 'modules', 'src', 'index.js') },
     format: 'esm',
     loader: { '.css': 'text' },
     logLevel: 'warning',
     minify: PRODUCTION,
-    outfile: join(LIBRARY_OUTPUT_DIRECTORY, 'webgpu-player', 'EmbeddedPlayer.js'),
+    outdir: join(LIBRARY_OUTPUT_DIRECTORY, 'webgpu-player'),
     platform: 'browser',
     sourcemap: PRODUCTION ? false : 'linked',
     target: 'es2022'
 });
+// The dedicated native audio module bundles the extension and its libFLAC encoder.
+const flacRoot = join(dirname(createRequire(import.meta.url).resolve('@mediabunny/flac-encoder')), '..', '..');
+for (const [source, name] of [['LICENSE', 'LICENSE.flac-encoder.txt'], ['licenses/libflac/COPYING.Xiph', 'LICENSE.libFLAC.txt']]) {
+    copyFileSync(join(flacRoot, source), join(LIBRARY_OUTPUT_DIRECTORY, 'webgpu-player', name));
+}
 console.log(`webgpu-player: built the embedding facade with ${packages.length} decoder packages (key ${assetKey})`);
