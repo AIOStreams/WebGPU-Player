@@ -1,10 +1,15 @@
+import type { InputOptions } from 'mediabunny';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { prepareNativeDtsPlayback } from 'webgpu-player/embed/NativeDtsPlayback';
 
+const opened = vi.fn<(options: InputOptions) => void>();
+
 vi.mock('mediabunny', async (original) => ({
     ...await original<typeof import('mediabunny')>(),
     Input: class {
+        constructor(options: InputOptions) { opened(options); }
+
         getPrimaryVideoTrack() {
             return { getCodec: () => 'avc', getDecoderConfig: () => ({ codec: 'avc1.64001f' }) };
         }
@@ -72,6 +77,35 @@ it('leaves a natively supported source on the direct playback path', async () =>
         const handle = await prepareNativeDtsPlayback(video, 'https://example.test/movie.mkv', {}, owner.signal, vi.fn());
         expect(handle).toBeNull();
         expect(fetch).not.toHaveBeenCalled();
+    } finally {
+        owner.abort();
+    }
+});
+
+it('forwards timed subtitle bytes without retaining the cluster or dispatching after abort', async () => {
+    vi.stubGlobal('MediaSource', { isTypeSupported: () => true });
+    vi.stubGlobal('AudioContext', class {
+        destination = { maxChannelCount: 2 };
+        close = vi.fn();
+    });
+    // eslint-disable-next-line compat/compat -- The native playback path requires AbortController.
+    const owner = new AbortController();
+    const subtitles = vi.fn();
+    try {
+        await prepareNativeDtsPlayback(document.createElement('video'), 'https://example.test/movie.mkv', {}, owner.signal, vi.fn(), subtitles);
+        const report = opened.mock.lastCall![0].formatOptions?.matroska?.onOtherTrackBlock;
+        expect(report).toBeTypeOf('function');
+        const cluster = new Uint8Array([7, 8, 9]);
+        const block = { trackNumber: 12, timestamp: 1.25, duration: 0.5, data: cluster.subarray(1, 2) };
+        report!(block);
+        report!({ ...block, duration: null });
+        cluster.fill(0);
+        const expected = { trackNumber: 12, timestampMs: 1250, durationMs: 500, data: new Uint8Array([8]) };
+        expect(subtitles.mock.calls).toEqual([[[expected]], [[{ ...expected, durationMs: null }]]]);
+        expect(subtitles.mock.calls[0][0][0].data.buffer.byteLength).toBe(1);
+        owner.abort();
+        report!(block);
+        expect(subtitles).toHaveBeenCalledTimes(2);
     } finally {
         owner.abort();
     }

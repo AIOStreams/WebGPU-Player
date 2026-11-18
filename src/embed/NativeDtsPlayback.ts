@@ -32,6 +32,7 @@ import {
 } from '../demux/AudioStartPacket';
 import { isDTSExpressTrack } from '../demux/CustomAudioTrackMetadata';
 import { secondsToMicroseconds } from '../MediaTime';
+import type { ContainerSubtitleBlock } from '../pipeline/DecodeWorkerProtocol';
 
 const FLAC_MIME = 'audio/mp4; codecs="flac"';
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -354,13 +355,28 @@ export async function prepareNativeDtsPlayback(
     url: string,
     headers: Record<string, string> | undefined,
     owner: AbortSignal,
-    onError: (error: unknown) => void
+    onError: (error: unknown) => void,
+    onSubtitleBlocks?: (blocks: readonly ContainerSubtitleBlock[]) => void
 ) {
     if (!('MediaSource' in globalThis && 'AudioContext' in globalThis && 'AbortController' in globalThis)) return null;
     const { MediaSource: NativeMediaSource, AudioContext: NativeAudioContext, AbortController: NativeAbortController } = globalThis;
     if (!NativeMediaSource.isTypeSupported(FLAC_MIME)) return null;
     const input = new Input({
         formats: [MATROSKA, MP4],
+        formatOptions: onSubtitleBlocks ? {
+            matroska: {
+                onOtherTrackBlock(block) {
+                    if (owner.aborted) return;
+                    onSubtitleBlocks([{
+                        trackNumber: block.trackNumber,
+                        timestampMs: block.timestamp * 1000,
+                        durationMs: block.duration === null ? null : block.duration * 1000,
+                        // The demuxer's view can retain an entire 4K cluster.
+                        data: block.data.slice()
+                    }]);
+                }
+            }
+        } : undefined,
         source: new UrlSource(url, {
             requestInit: { headers },
             maxCacheSize: 12 * 1024 * 1024,
