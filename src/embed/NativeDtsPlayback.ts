@@ -19,9 +19,17 @@ import {
     type InputVideoTrack
 } from 'mediabunny';
 
+import { isSupportedTrueHDInputRoute } from '../audio/CustomCompressedAudioRoute';
 import { prepareCustomAudioOutputChannelData } from '../audio/processing/CustomAudioChannelLayout';
+import { getCustomAudioOutputChannelMask } from '../audio/processing/CustomWaveChannelLayout';
 import PackageSoftwareAudioDecoder from '../decode/audio/PackageSoftwareAudioDecoder';
 import { loadDecoderPackage, type AudioDecoderPackage } from '../decode/packages/DecoderPackage';
+import {
+    DTS_SEEK_PREROLL_MICROSECONDS,
+    getAudioPrerollTimeMicroseconds,
+    getAudioStartPacket,
+    TRUEHD_MAJOR_SYNC_PREROLL_MICROSECONDS
+} from '../demux/AudioStartPacket';
 import { isDTSExpressTrack } from '../demux/CustomAudioTrackMetadata';
 import { secondsToMicroseconds } from '../MediaTime';
 
@@ -100,7 +108,15 @@ function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, signal:
     return { output: new Output({ format, target: new NullTarget() }), ready: () => ready };
 }
 
+type SoftwareCodec = 'dts' | 'truehd';
+const seekPreroll = {
+    dts: DTS_SEEK_PREROLL_MICROSECONDS,
+    truehd: TRUEHD_MAJOR_SYNC_PREROLL_MICROSECONDS,
+    passthrough: 0
+};
+
 type AudioChoice = {
+    softwareCodec: SoftwareCodec | null;
     track: InputAudioTrack;
     codec: NonNullable<Awaited<ReturnType<InputAudioTrack['getCodec']>>>;
     config: AudioDecoderConfig | null;
@@ -111,7 +127,7 @@ type AudioChoice = {
     isDefault: boolean;
 };
 
-async function audioChoice(track: InputAudioTrack): Promise<AudioChoice | null> {
+async function audioChoice(track: InputAudioTrack, element: HTMLVideoElement): Promise<AudioChoice | null> {
     const [codec, config, language, title, disposition] = await Promise.all([
         track.getCodec(),
         track.getDecoderConfig(),
@@ -120,8 +136,17 @@ async function audioChoice(track: InputAudioTrack): Promise<AudioChoice | null> 
         track.getDisposition()
     ]);
     if (!codec || isDTSExpressTrack(codec, config)) return null;
-    const mime = codec === 'dts' ? FLAC_MIME : `audio/mp4; codecs="${config?.codec}"`;
-    if (!MediaSource.isTypeSupported(mime)) return null;
+    const nativeMime = `audio/mp4; codecs="${config?.codec}"`;
+    const canPass = !!config && MediaSource.isTypeSupported(nativeMime);
+    const channels = await track.getNumberOfChannels();
+    let softwareCodec: SoftwareCodec | null = null;
+    if (codec === 'dts' && (!canPass || !element.canPlayType('audio/mp4; codecs="dtsl"'))) softwareCodec = codec;
+    if (codec === 'truehd' && (!canPass || !element.canPlayType('audio/mp4; codecs="mlpa"'))) {
+        if (!isSupportedTrueHDInputRoute(codec, channels, await track.getSampleRate())) return null;
+        softwareCodec = codec;
+    }
+    const mime = softwareCodec ? FLAC_MIME : nativeMime;
+    if (!softwareCodec && !canPass) return null;
     return {
         track,
         codec,
@@ -129,25 +154,26 @@ async function audioChoice(track: InputAudioTrack): Promise<AudioChoice | null> 
         mime,
         language,
         title,
-        channels: await track.getNumberOfChannels(),
+        channels,
+        softwareCodec,
         isDefault: disposition.default
     };
 }
 
-let dtsPackage: Promise<AudioDecoderPackage> | undefined;
-function loadDts(): Promise<AudioDecoderPackage> {
-    dtsPackage ??= (async () => {
-        const response = await fetch(new URL('../wgpud/dts.wasm', import.meta.url));
-        if (!response.ok && response.status !== 0) throw new Error('DTS decoder unavailable');
+const decoderPackages: Partial<Record<SoftwareCodec, Promise<AudioDecoderPackage>>> = {};
+function loadAudioDecoder(codec: SoftwareCodec): Promise<AudioDecoderPackage> {
+    decoderPackages[codec] ??= (async () => {
+        const response = await fetch(new URL(`../wgpud/${codec}.wasm`, import.meta.url));
+        if (!response.ok && response.status !== 0) throw new Error(`${codec} decoder unavailable`);
         const pkg = await loadDecoderPackage(await response.arrayBuffer());
-        if (pkg.kind !== 'audio') throw new Error('Invalid DTS decoder package');
+        if (pkg.kind !== 'audio') throw new Error(`Invalid ${codec} decoder package`);
         registerFlacEncoder();
         return pkg;
     })().catch((error) => {
-        dtsPackage = undefined;
+        delete decoderPackages[codec];
         throw error;
     });
-    return dtsPackage;
+    return decoderPackages[codec];
 }
 
 type NativeSource = {
@@ -157,7 +183,6 @@ type NativeSource = {
     videoMime: string;
     dolbyVisionConfig?: Uint8Array;
     duration: number;
-    decoder: AudioDecoderPackage;
 };
 
 function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'], config: VideoDecoderConfig) {
@@ -172,7 +197,7 @@ function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'],
 }
 
 function flacSamples(flac: AudioSampleSource, start: number, outputLayout: 'stereo' | '5.1') {
-    // Each AudioSample sent to the FLAC worker carries several DTS blocks.
+    // Each AudioSample sent to the FLAC worker carries several decoded blocks.
     const channels = outputLayout === '5.1' ? 6 : 2;
     const capacity = 8192;
     const stereo = outputLayout === 'stereo';
@@ -238,7 +263,9 @@ async function feedEpoch(
     const key = (await vr.getKeyAt(target)) ?? (await vr.getFirstKey());
     if (!key) throw new Error('No video keyframe');
     const start = key.timestamp;
-    const audioStart = (await ar.getAt(start)) ?? (await ar.getFirst());
+    const origin = secondsToMicroseconds(0);
+    const lookup = getAudioPrerollTimeMicroseconds(secondsToMicroseconds(start), seekPreroll[audio.softwareCodec ?? 'passthrough'], origin);
+    const audioStart = await getAudioStartPacket(ar, lookup, origin);
     signal.throwIfAborted();
     media.duration = source.duration;
     const videoBuffer = media.addSourceBuffer(source.videoMime);
@@ -250,7 +277,7 @@ async function feedEpoch(
     const sound = fragmentOutput(audioBuffer, element, signal, appended);
     const picture = new EncodedVideoPacketSource(source.codec);
     video.output.addVideoTrack(picture, { dolbyVisionConfig: source.dolbyVisionConfig });
-    const flac = audio.codec === 'dts' ? new AudioSampleSource({ codec: 'flac' }) : null;
+    const flac = audio.softwareCodec ? new AudioSampleSource({ codec: 'flac' }) : null;
     const passthrough = flac ? null : new EncodedAudioPacketSource(audio.codec);
     sound.output.addAudioTrack(flac ?? passthrough!);
     let decoder: PackageSoftwareAudioDecoder | undefined;
@@ -262,7 +289,12 @@ async function feedEpoch(
         signal.throwIfAborted();
     };
     try {
-        if (flac) decoder = await PackageSoftwareAudioDecoder.create(source.decoder, 'dts', null);
+        if (audio.softwareCodec) {
+            const pkg = await loadAudioDecoder(audio.softwareCodec);
+            signal.throwIfAborted();
+            decoder = await PackageSoftwareAudioDecoder.create(pkg, audio.softwareCodec, null);
+            decoder.setRenderTarget({ channelMask: getCustomAudioOutputChannelMask(outputLayout), binaural: false });
+        }
         await Promise.all([video.output.start(), sound.output.start()]);
         let nextVideo: EncodedPacket | null = key;
         const writeVideo = async (end: number): Promise<void> => {
@@ -353,8 +385,8 @@ export async function prepareNativeDtsPlayback(
         owner.throwIfAborted();
         const video = await input.getPrimaryVideoTrack();
         if (!video) return null;
-        const tracks = await Promise.all((await input.getAudioTracks()).map(audioChoice));
-        if (!tracks.some((track) => track?.codec === 'dts')) return null;
+        const tracks = await Promise.all((await input.getAudioTracks()).map((track) => audioChoice(track, element)));
+        if (!tracks.some((track) => track?.softwareCodec)) return null;
         const [codec, config, duration] = await Promise.all([
             video.getCodec(),
             video.getDecoderConfig(),
@@ -363,7 +395,7 @@ export async function prepareNativeDtsPlayback(
         if (!codec || !config || !duration || !Number.isFinite(duration)) return null;
         const format = nativeVideoFormat(video, codec, config);
         if (!format) return null;
-        const source: NativeSource = { video, codec, config, duration, ...format, decoder: await loadDts() };
+        const source: NativeSource = { video, codec, config, duration, ...format };
         owner.throwIfAborted();
         let selected = tracks.findIndex((track) => track?.isDefault);
         if (selected < 0) selected = tracks.findIndex((track) => track !== null);
