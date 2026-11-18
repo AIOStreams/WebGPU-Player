@@ -1,0 +1,12 @@
+type TrackBuffer = Pick<SourceBuffer, 'buffered'>;
+
+/** A muxer can hold packets until the next keyframe. Only pause the reader once both active tracks have submitted enough media. */
+export function canWaitForPlayback(readThrough: number, position: number, video: TrackBuffer | null, audio: TrackBuffer | null): boolean {
+    if (readThrough <= position + 4.5) return false;
+    const hasReserve = (track: TrackBuffer | null): boolean => {
+        if (!track) return true;
+        const ranges = track.buffered;
+        return ranges.length > 0 && ranges.end(ranges.length - 1) >= position + 2;
+    };
+    return hasReserve(video) && hasReserve(audio);
+}

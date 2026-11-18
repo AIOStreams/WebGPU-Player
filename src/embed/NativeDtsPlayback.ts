@@ -32,6 +32,7 @@ import {
 } from '../demux/AudioStartPacket';
 import { isDTSExpressTrack } from '../demux/CustomAudioTrackMetadata';
 import { secondsToMicroseconds } from '../MediaTime';
+import { canWaitForPlayback } from './NativeBuffering';
 import type { ContainerSubtitleBlock } from '../pipeline/DecodeWorkerProtocol';
 
 const FLAC_MIME = 'audio/mp4; codecs="flac"';
@@ -282,13 +283,6 @@ async function feedEpoch(
     const passthrough = flac ? null : new EncodedAudioPacketSource(audio.codec);
     sound.output.addAudioTrack(flac ?? passthrough!);
     let decoder: PackageSoftwareAudioDecoder | undefined;
-    const throttle = async (timestamp: number): Promise<void> => {
-        while (timestamp > Math.max(target, element.currentTime) + 4.5) {
-            signal.throwIfAborted();
-            await sleep(75);
-        }
-        signal.throwIfAborted();
-    };
     try {
         if (audio.softwareCodec) {
             const pkg = await loadAudioDecoder(audio.softwareCodec);
@@ -330,9 +324,13 @@ async function feedEpoch(
         };
         let end = start;
         while (nextVideo || nextAudio) {
+            signal.throwIfAborted();
+            const position = Math.max(target, element.currentTime);
+            if (canWaitForPlayback(end, position, nextVideo && videoBuffer, nextAudio && audioBuffer)) {
+                await sleep(75);
+                continue;
+            }
             end += 1;
-            // Do not throttle a long GOP before its muxer emits the first complete fragment.
-            if (videoBuffer.buffered.length && audioBuffer.buffered.length) await throttle(end - 1);
             await Promise.all([writeVideo(end), writeAudio(end)]);
         }
         if (decoder && samples) {
