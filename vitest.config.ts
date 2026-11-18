@@ -1,10 +1,15 @@
 /// <reference types="vitest/config" />
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import tsconfigPaths from 'vite-tsconfig-paths';
 
 import LAYOUT from './tools/constants.json';
 
 export default defineConfig({
+    // The FLAC extension also installs upstream Mediabunny as a peer. Tests use the engine's fork.
+    resolve: {
+        alias: { mediabunny: fileURLToPath(new URL('./vendor/mediabunny/dist/modules/src/index.js', import.meta.url)) }
+    },
     plugins: [ tsconfigPaths() ],
     test: {
         environment: 'jsdom',
