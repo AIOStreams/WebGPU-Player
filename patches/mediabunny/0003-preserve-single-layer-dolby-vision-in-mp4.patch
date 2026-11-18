@@ -1,0 +1,289 @@
+diff --git a/src/codec.ts b/src/codec.ts
+index 45820a2..f689183 100644
+--- a/src/codec.ts
++++ b/src/codec.ts
+@@ -129,6 +129,21 @@ export const SUBTITLE_CODECS = [
+  * @public
+  */
+ export type VideoCodec = typeof VIDEO_CODECS[number];
++
++/**
++ * Returns the HEVC codec string for a single-layer Dolby Vision profile 5 or 8 configuration record.
++ * The dvhe sample entry allows parameter sets in the samples as well as in hvcC.
++ * @group Codecs
++ * @public
++ */
++export const getDolbyVisionHevcCodec = (record: Uint8Array) => {
++	if (record.length < 24 || record.length > 1024 || record[0] !== 1) return null;
++	const profile = record[2]! >> 1;
++	const level = ((record[2]! & 1) << 5) | (record[3]! >> 3);
++	// A single video track carries the base layer and RPU. A separate enhancement layer would be lost.
++	if ((profile !== 5 && profile !== 8) || !level || (record[3]! & 7) !== 5) return null;
++	return `dvhe.${String(profile).padStart(2, '0')}.${String(level).padStart(2, '0')}`;
++};
+ /**
+  * Union type of known audio codecs.
+  * @group Codecs
+diff --git a/src/index.ts b/src/index.ts
+index 0ba1090..3fbe3a5 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -90,6 +90,7 @@ export {
+ 	VideoSampleSource,
+ } from './media-source';
+ export {
++	getDolbyVisionHevcCodec,
+ 	type MediaCodec,
+ 	type VideoCodec,
+ 	type AudioCodec,
+diff --git a/src/input-track.ts b/src/input-track.ts
+index 327320f..510ba1e 100644
+--- a/src/input-track.ts
++++ b/src/input-track.ts
+@@ -667,6 +667,7 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
+ 	getColorSpace(): Promise<VideoColorSpaceInit>;
+ 	canBeTransparent(): Promise<boolean>;
+ 	getFieldOrder?(): MaybePromise<VideoFieldOrder | null>;
++	getDolbyVisionConfig?(): Uint8Array | null;
+ 	getDecoderConfig(): Promise<VideoDecoderConfig | null>;
+ }
+ 
+@@ -922,6 +923,11 @@ export class InputVideoTrack extends InputTrack {
+ 		return (await this._backing.getFieldOrder?.()) ?? null;
+ 	}
+ 
++	/** Returns a copy of this track's Dolby Vision configuration record, or null when absent. */
++	getDolbyVisionConfig(): Uint8Array | null {
++		return this._backing.getDolbyVisionConfig?.()?.slice() ?? null;
++	}
++
+ 	/**
+ 	 * Returns the [decoder configuration](https://www.w3.org/TR/webcodecs/#video-decoder-config) for decoding the
+ 	 * track's packets using a [`VideoDecoder`](https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder). Returns
+diff --git a/src/isobmff/isobmff-boxes.ts b/src/isobmff/isobmff-boxes.ts
+index 7e372c1..6909015 100644
+--- a/src/isobmff/isobmff-boxes.ts
++++ b/src/isobmff/isobmff-boxes.ts
+@@ -288,6 +288,7 @@ export const fullBox = (
+ export const ftyp = (details: {
+ 	isQuickTime: boolean;
+ 	holdsAvc: boolean;
++	dolbyVision: boolean;
+ 	fragmented: boolean;
+ 	cmaf: boolean;
+ 	appleAudiobook: boolean;
+@@ -316,6 +317,7 @@ export const ftyp = (details: {
+ 				ascii('iso5'),
+ 				ascii('iso6'),
+ 				ascii('mp41'),
++				details.dolbyVision ? ascii('dby1') : [],
+ 				ascii('cmfc'),
+ 				ascii('dash'),
+ 			]);
+@@ -327,6 +329,7 @@ export const ftyp = (details: {
+ 				ascii('iso5'),
+ 				ascii('iso6'),
+ 				ascii('mp41'),
++				details.dolbyVision ? ascii('dby1') : [],
+ 			]);
+ 		}
+ 	}
+@@ -347,6 +350,7 @@ export const ftyp = (details: {
+ 		// Compatible brands
+ 		ascii('isom'),
+ 		details.holdsAvc ? ascii('avc1') : [],
++		details.dolbyVision ? ascii('dby1') : [],
+ 		ascii('mp41'),
+ 	]);
+ };
+@@ -735,7 +739,9 @@ export const stsd = (trackData: IsobmffTrackData) => {
+ 
+ 	if (trackData.type === 'video') {
+ 		sampleDescription = videoSampleDescription(
+-			videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec),
++			trackData.track.metadata.dolbyVisionConfig
++				? 'dvhe'
++				: videoCodecToBoxName(trackData.track.source._codec, trackData.info.decoderConfig.codec),
+ 			trackData,
+ 		);
+ 	} else if (trackData.type === 'audio') {
+@@ -801,6 +807,11 @@ export const videoSampleDescription = (
+ 	i16(0xffff), // Pre-defined
+ ], [
+ 	VIDEO_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec]?.(trackData) ?? null,
++	trackData.track.metadata.dolbyVisionConfig
++		? box((trackData.track.metadata.dolbyVisionConfig[2]! >> 1) >= 8 ? 'dvvC' : 'dvcC', [
++				...trackData.track.metadata.dolbyVisionConfig,
++			])
++		: null,
+ 	pasp(trackData),
+ 	colorSpaceIsEmpty(trackData.info.decoderConfig.colorSpace)
+ 		? null
+diff --git a/src/isobmff/isobmff-demuxer.ts b/src/isobmff/isobmff-demuxer.ts
+index 659bad1..9657d56 100644
+--- a/src/isobmff/isobmff-demuxer.ts
++++ b/src/isobmff/isobmff-demuxer.ts
+@@ -143,6 +143,7 @@ const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1]
+ const MAX_TRACK_BOX_READ_THROUGH_SIZE = 2 ** 20;
+ 
+ type InternalTrack = {
++	dolbyVisionConfig?: Uint8Array;
+ 	unsupportedFeatures: UnsupportedTrackFeature[];
+ 	id: number;
+ 	demuxer: IsobmffDemuxer;
+@@ -1857,6 +1858,14 @@ export class IsobmffDemuxer extends Demuxer {
+ 				track.info.codecDescription = readBytes(slice, boxInfo.contentSize - DVC1_HEADER_SIZE);
+ 			}; break;
+ 
++			case 'dvcC':
++			case 'dvvC': {
++				const track = this.currentTrack;
++				if (track?.info?.type === 'video' && boxInfo.contentSize >= 24 && boxInfo.contentSize <= 1024) {
++					track.dolbyVisionConfig = readBytes(slice, boxInfo.contentSize).slice();
++				}
++			}; break;
++
+ 			case 'hvcC': {
+ 				const track = this.currentTrack;
+ 				if (!track || track.info?.type !== 'video') {
+@@ -3958,6 +3967,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
+ }
+ 
+ class IsobmffVideoTrackBacking extends IsobmffTrackBacking implements InputVideoTrackBacking {
++	getDolbyVisionConfig() {
++		return this.internalTrack.dolbyVisionConfig ?? null;
++	}
++
+ 	declare internalTrack: InternalVideoTrack;
+ 	decoderConfigPromise: Promise<VideoDecoderConfig> | null = null;
+ 
+diff --git a/src/isobmff/isobmff-muxer.ts b/src/isobmff/isobmff-muxer.ts
+index 68f7283..66970ac 100644
+--- a/src/isobmff/isobmff-muxer.ts
++++ b/src/isobmff/isobmff-muxer.ts
+@@ -40,6 +40,7 @@ import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '.
+ import {
+ 	OPUS_PRE_ROLL_DURATION,
+ 	OPUS_SAMPLE_RATE,
++	getDolbyVisionHevcCodec,
+ 	parsePcmCodec,
+ 	PCM_AUDIO_CODECS,
+ 	PcmAudioCodec,
+@@ -334,6 +335,7 @@ export class IsobmffMuxer extends Muxer {
+ 			boxWriter.writeBox(ftyp({
+ 				isQuickTime: this.isQuickTime,
+ 				holdsAvc: holdsAvc,
++				dolbyVision: this.output.tracks.some(track => track.isVideoTrack() && track.metadata.dolbyVisionConfig),
+ 				fragmented: this.isFragmented,
+ 				cmaf: this.isCmaf,
+ 				appleAudiobook: !!this.formatOptions.appleAudiobook,
+@@ -422,7 +424,8 @@ export class IsobmffMuxer extends Muxer {
+ 
+ 		const codecStrings = this.trackDatas.map((trackData) => {
+ 			if (trackData.type === 'video') {
+-				return trackData.info.decoderConfig.codec;
++				const record = trackData.track.metadata.dolbyVisionConfig;
++				return (record && getDolbyVisionHevcCodec(record)) || trackData.info.decoderConfig.codec;
+ 			} else if (trackData.type === 'audio') {
+ 				return trackData.info.decoderConfig.codec;
+ 			} else {
+diff --git a/src/matroska/ebml.ts b/src/matroska/ebml.ts
+index f9e1eee..9f3f83f 100644
+--- a/src/matroska/ebml.ts
++++ b/src/matroska/ebml.ts
+@@ -82,6 +82,9 @@ export enum EBMLId {
+ 	MuxingApp = 0x4d80,
+ 	WritingApp = 0x5741,
+ 	Tracks = 0x1654ae6b,
++	BlockAdditionMapping = 0x41e4,
++	BlockAddIDType = 0x41e7,
++	BlockAddIDExtraData = 0x41ed,
+ 	TrackEntry = 0xae,
+ 	TrackNumber = 0xd7,
+ 	TrackUID = 0x73c5,
+diff --git a/src/matroska/matroska-demuxer.ts b/src/matroska/matroska-demuxer.ts
+index b003dcc..76fc87e 100644
+--- a/src/matroska/matroska-demuxer.ts
++++ b/src/matroska/matroska-demuxer.ts
+@@ -249,6 +249,7 @@ type InternalTrack = {
+ 	trackBacking: InputTrackBacking | null;
+ 	codecId: string | null;
+ 	codecPrivate: Uint8Array | null;
++	dolbyVisionConfig?: Uint8Array;
+ 	defaultDuration: number | null;
+ 	defaultDurationNs: number | null;
+ 	codecDelay: number;
+@@ -1318,6 +1319,27 @@ export class MatroskaDemuxer extends Demuxer {
+ 				);
+ 			}; break;
+ 
++			case EBMLId.BlockAdditionMapping: {
++				if (!this.currentTrack) break;
++				const mapping = slice.slice(dataStartPos, size);
++				let type: number | undefined;
++				let extraData: Uint8Array | undefined;
++				while (mapping.remainingLength >= MIN_HEADER_SIZE) {
++					const child = readElementHeader(mapping);
++					if (!child || child.size === undefined || child.size > mapping.remainingLength) break;
++					if (child.id === EBMLId.BlockAddIDType && child.size <= 8) {
++						type = readUnsignedInt(mapping, child.size);
++					} else if (child.id === EBMLId.BlockAddIDExtraData && child.size >= 24 && child.size <= 1024) {
++						extraData = readBytes(mapping, child.size);
++					} else {
++						mapping.skip(child.size);
++					}
++				}
++				if ((type === 0x64766343 || type === 0x64767643) && extraData) {
++					this.currentTrack.dolbyVisionConfig = extraData.slice(); // dvcC or dvvC
++				}
++			}; break;
++
+ 			case EBMLId.TrackEntry: {
+ 				if (!this.currentSegment) break;
+ 
+@@ -2989,6 +3011,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
+ }
+ 
+ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVideoTrackBacking {
++	getDolbyVisionConfig() {
++		return this.internalTrack.dolbyVisionConfig ?? null;
++	}
++
+ 	declare internalTrack: InternalVideoTrack;
+ 	decoderConfigPromise: Promise<VideoDecoderConfig> | null = null;
+ 
+diff --git a/src/output.ts b/src/output.ts
+index 78dc81f..e2b4009 100644
+--- a/src/output.ts
++++ b/src/output.ts
+@@ -25,7 +25,7 @@ import { PathedTarget, Target, TargetRequest } from './target';
+ import { Writer } from './writer';
+ import { Logging } from './logging';
+ import { EncodedPacket } from './packet';
+-import { validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
++import { getDolbyVisionHevcCodec, validateAudioChunkMetadata, validateVideoChunkMetadata } from './codec';
+ 
+ /**
+  * List of all track types.
+@@ -269,6 +269,8 @@ export type BaseTrackMetadata = {
+  * @public
+  */
+ export type VideoTrackMetadata = BaseTrackMetadata & {
++	/** Single-layer HEVC Dolby Vision decoder configuration record to write into an MP4 video sample entry. */
++	dolbyVisionConfig?: Uint8Array;
+ 	/**
+ 	 * The angle in degrees by which the track's frames should be rotated (clockwise). Rotation is applied before any
+ 	 * flip.
+@@ -705,6 +707,12 @@ export class Output<
+ 		if (metadata.canBeTransparent !== undefined && typeof metadata.canBeTransparent !== 'boolean') {
+ 			throw new TypeError('metadata.canBeTransparent, when provided, must be a boolean.');
+ 		}
++		if (metadata.dolbyVisionConfig !== undefined && (
++			source._codec !== 'hevc' || !(metadata.dolbyVisionConfig instanceof Uint8Array)
++			|| !getDolbyVisionHevcCodec(metadata.dolbyVisionConfig)
++		)) {
++			throw new TypeError('metadata.dolbyVisionConfig requires a single-layer HEVC Dolby Vision record.');
++		}
+ 		if (metadata.decoderConfig !== undefined) {
+ 			validateVideoChunkMetadata({ decoderConfig: metadata.decoderConfig }, source._codec);
+ 		}

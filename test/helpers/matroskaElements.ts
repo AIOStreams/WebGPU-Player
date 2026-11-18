@@ -21,6 +21,8 @@ export type SyntheticMatroskaVideoTrack = Readonly<{
     infoElements?: readonly Uint8Array[]
     pixelHeight: number
     pixelWidth: number
+    /** Additional TrackEntry children, such as BlockAdditionMapping. */
+    trackElements?: readonly Uint8Array[]
     /** Elements of the track's Video element after its pixel size, such as FlagInterlaced and FieldOrder */
     videoElements?: readonly Uint8Array[]
 }>;
@@ -163,6 +165,7 @@ export function createVideoTrackMatroska(track: SyntheticMatroskaVideoTrack): Ui
                 createASCIIElement(CODEC_ID, track.codecID),
                 ...(track.codecPrivate ? [ createElement(CODEC_PRIVATE_ID, track.codecPrivate) ] : []),
                 createUnsignedIntegerElement(DEFAULT_DURATION_ID, track.defaultDurationMilliseconds * NANOSECONDS_PER_MILLISECOND),
+                ...(track.trackElements ?? []),
                 createElement(VIDEO_ID, concatenate([
                     createUnsignedIntegerElement(PIXEL_WIDTH_ID, track.pixelWidth),
                     createUnsignedIntegerElement(PIXEL_HEIGHT_ID, track.pixelHeight),

@@ -5,6 +5,7 @@ import {
     AudioSampleSource,
     EncodedAudioPacketSource,
     EncodedVideoPacketSource,
+    getDolbyVisionHevcCodec,
     Input,
     MATROSKA,
     MP4,
@@ -153,9 +154,22 @@ type NativeSource = {
     video: InputVideoTrack;
     codec: NonNullable<Awaited<ReturnType<InputVideoTrack['getCodec']>>>;
     config: VideoDecoderConfig;
+    videoMime: string;
+    dolbyVisionConfig?: Uint8Array;
     duration: number;
     decoder: AudioDecoderPackage;
 };
+
+function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'], config: VideoDecoderConfig) {
+    const record = codec === 'hevc' ? video.getDolbyVisionConfig() : null;
+    if (record) {
+        const dvCodec = getDolbyVisionHevcCodec(record);
+        const videoMime = `video/mp4; codecs="${dvCodec}"`;
+        if (dvCodec && MediaSource.isTypeSupported(videoMime)) return { videoMime, dolbyVisionConfig: record };
+    }
+    const videoMime = `video/mp4; codecs="${config.codec}"`;
+    return MediaSource.isTypeSupported(videoMime) ? { videoMime } : null;
+}
 
 function flacSamples(flac: AudioSampleSource, start: number, outputLayout: 'stereo' | '5.1') {
     // Each AudioSample sent to the FLAC worker carries several DTS blocks.
@@ -227,7 +241,7 @@ async function feedEpoch(
     const audioStart = (await ar.getAt(start)) ?? (await ar.getFirst());
     signal.throwIfAborted();
     media.duration = source.duration;
-    const videoBuffer = media.addSourceBuffer(`video/mp4; codecs="${source.config.codec}"`);
+    const videoBuffer = media.addSourceBuffer(source.videoMime);
     const audioBuffer = media.addSourceBuffer(audio.mime);
     videoBuffer.timestampOffset = start;
     audioBuffer.timestampOffset = start;
@@ -235,7 +249,7 @@ async function feedEpoch(
     const video = fragmentOutput(videoBuffer, element, signal, appended);
     const sound = fragmentOutput(audioBuffer, element, signal, appended);
     const picture = new EncodedVideoPacketSource(source.codec);
-    video.output.addVideoTrack(picture);
+    video.output.addVideoTrack(picture, { dolbyVisionConfig: source.dolbyVisionConfig });
     const flac = audio.codec === 'dts' ? new AudioSampleSource({ codec: 'flac' }) : null;
     const passthrough = flac ? null : new EncodedAudioPacketSource(audio.codec);
     sound.output.addAudioTrack(flac ?? passthrough!);
@@ -346,14 +360,10 @@ export async function prepareNativeDtsPlayback(
             video.getDecoderConfig(),
             input.getDurationFromMetadata()
         ]);
-        if (
-            !codec
-            || !config
-            || !duration
-            || !Number.isFinite(duration)
-            || !MediaSource.isTypeSupported(`video/mp4; codecs="${config.codec}"`)
-        ) { return null; }
-        const source: NativeSource = { video, codec, config, duration, decoder: await loadDts() };
+        if (!codec || !config || !duration || !Number.isFinite(duration)) return null;
+        const format = nativeVideoFormat(video, codec, config);
+        if (!format) return null;
+        const source: NativeSource = { video, codec, config, duration, ...format, decoder: await loadDts() };
         owner.throwIfAborted();
         let selected = tracks.findIndex((track) => track?.isDefault);
         if (selected < 0) selected = tracks.findIndex((track) => track !== null);
