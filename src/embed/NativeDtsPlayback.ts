@@ -340,8 +340,7 @@ export async function prepareNativeDtsPlayback(
         const video = await input.getPrimaryVideoTrack();
         if (!video) return null;
         const tracks = await Promise.all((await input.getAudioTracks()).map(audioChoice));
-        const eligible = tracks.filter((track): track is AudioChoice => track !== null);
-        if (!eligible.some((track) => track.codec === 'dts') || eligible.length !== tracks.length) return null;
+        if (!tracks.some((track) => track?.codec === 'dts')) return null;
         const [codec, config, duration] = await Promise.all([
             video.getCodec(),
             video.getDecoderConfig(),
@@ -356,10 +355,8 @@ export async function prepareNativeDtsPlayback(
         ) { return null; }
         const source: NativeSource = { video, codec, config, duration, decoder: await loadDts() };
         owner.throwIfAborted();
-        let selected = Math.max(
-            0,
-            eligible.findIndex((track) => track.isDefault)
-        );
+        let selected = tracks.findIndex((track) => track?.isDefault);
+        if (selected < 0) selected = tracks.findIndex((track) => track !== null);
         // A webOS app with the built-in speakers has a stereo destination; only opt into 5.1 when the host can actually output it.
         let outputLayout: 'stereo' | '5.1' = 'stereo';
         const context = new NativeAudioContext();
@@ -378,7 +375,8 @@ export async function prepareNativeDtsPlayback(
         };
         const start = (seconds: number, ordinal = selected): void => {
             const target = Math.max(0, Math.min(duration, seconds));
-            if (!eligible[ordinal] || owner.aborted) return;
+            const audio = tracks[ordinal];
+            if (!audio || owner.aborted) return;
             release();
             selected = ordinal;
             epoch = new NativeAbortController();
@@ -409,10 +407,10 @@ export async function prepareNativeDtsPlayback(
                     feedEpoch(
                         element,
                         source,
-                        eligible[ordinal],
+                        audio,
                         target,
                         { media, signal, appended },
-                        eligible[ordinal].channels > 2 ? outputLayout : 'stereo'
+                        audio.channels > 2 ? outputLayout : 'stereo'
                     )
                 )
                 .catch((error) => {
@@ -424,12 +422,13 @@ export async function prepareNativeDtsPlayback(
         };
         retained = true;
         return {
-            tracks: eligible.map((track) => ({
+            tracks: tracks.flatMap((track, ordinal) => track ? [{
+                ordinal,
                 label: track.title ?? '',
                 language: track.language,
                 codec: track.codec,
                 default: track.isDefault
-            })),
+            }] : []),
             selected: () => selected,
             start,
             setPaused,
