@@ -17,7 +17,9 @@ import {
     UrlSource,
     type EncodedPacket,
     type InputAudioTrack,
-    type InputVideoTrack
+    type InputTrack,
+    type InputVideoTrack,
+    type Rotation
 } from 'mediabunny';
 
 import { isSupportedTrueHDInputRoute } from '../audio/CustomCompressedAudioRoute';
@@ -188,6 +190,7 @@ type NativeSource = {
     codec: NonNullable<Awaited<ReturnType<InputVideoTrack['getCodec']>>>;
     config: VideoDecoderConfig;
     videoMime: string;
+    rotation: Rotation;
     dolbyVisionConfig?: Uint8Array;
     duration: number;
     origin: number;
@@ -199,9 +202,34 @@ function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'],
         const dvCodec = getDolbyVisionHevcCodec(record);
         const videoMime = `video/mp4; codecs="${dvCodec}"`;
         if (dvCodec && MediaSource.isTypeSupported(videoMime)) return { videoMime, dolbyVisionConfig: record };
+        if (!(record[4] >> 4)) return null; // A base layer with no compatibility ID needs a Dolby Vision decoder.
     }
     const videoMime = `video/mp4; codecs="${config.codec}"`;
     return MediaSource.isTypeSupported(videoMime) ? { videoMime } : null;
+}
+
+// Matroska Cues and fragmented MP4 random-access entries can locate the last packet.
+// Without a usable index a lookup can scan forward. Limit network reads for this optional probe.
+async function nativeEnd(input: Input, tracks: InputTrack[], transport: boolean): Promise<number | null> {
+    if (transport) return input.computeDuration(tracks, { skipLiveWait: true });
+    const metadata = await input.getDurationFromMetadata();
+    if (metadata !== null) return metadata;
+    if (await input.source.getSizeOrNull() === null) return null;
+    let bytes = 0;
+    const limit = 8 * 1024 * 1024;
+    const stop = input.source.on('read', ({ start, end }) => {
+        bytes += end - start;
+        if (bytes > limit) input.dispose();
+    });
+    try {
+        const end = await input.computeDuration(tracks, { skipLiveWait: true });
+        return bytes > limit ? null : end;
+    } catch (error) {
+        if (bytes <= limit) throw error;
+        return null;
+    } finally {
+        stop();
+    }
 }
 
 // An epoch owns its muxers, decoder, SourceBuffers and object URL. A seek outside the buffer or an audio
@@ -234,7 +262,7 @@ async function feedEpoch(
     const video = fragmentOutput(videoBuffer, element, signal, appended);
     const sound = fragmentOutput(audioBuffer, element, signal, appended);
     const picture = new EncodedVideoPacketSource(source.codec);
-    video.output.addVideoTrack(picture, { dolbyVisionConfig: source.dolbyVisionConfig });
+    video.output.addVideoTrack(picture, { rotation: source.rotation, dolbyVisionConfig: source.dolbyVisionConfig });
     const flac = audio.softwareCodec ? new AudioSampleSource({ codec: 'flac' }) : null;
     const passthrough = flac ? null : new EncodedAudioPacketSource(audio.codec);
     sound.output.addAudioTrack(flac ?? passthrough!);
@@ -385,10 +413,11 @@ export async function prepareNativeDtsPlayback(
         const isTransportStream = await input.getFormat() === MPEG_TS;
         if (isTransportStream && await input.source.getSizeOrNull() === null) return null;
         const playableTracks = [video, ...tracks.flatMap((audio) => audio ? [audio.track] : [])];
-        const [codec, config, end, originTime] = await Promise.all([
+        const [codec, config, rotation, end, originTime] = await Promise.all([
             video.getCodec(),
             video.getDecoderConfig(),
-            isTransportStream ? input.computeDuration(playableTracks, { skipLiveWait: true }) : input.getDurationFromMetadata(),
+            video.getRotation(),
+            nativeEnd(input, playableTracks, isTransportStream),
             readPlaybackTimelineOriginMicroseconds(input, playableTracks)
         ]);
         const origin = microsecondsToSeconds(originTime);
@@ -396,7 +425,7 @@ export async function prepareNativeDtsPlayback(
         if (!codec || !config || !Number.isFinite(duration) || duration <= 0) return null;
         const format = nativeVideoFormat(video, codec, config);
         if (!format) return null;
-        const source: NativeSource = { video, codec, config, duration, origin, ...format };
+        const source: NativeSource = { video, codec, config, rotation, duration, origin, ...format };
         owner.throwIfAborted();
         let selected = tracks.findIndex((track) => track?.isDefault);
         if (selected < 0) selected = tracks.findIndex((track) => track !== null);
