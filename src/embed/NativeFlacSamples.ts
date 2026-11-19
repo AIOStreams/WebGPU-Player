@@ -13,6 +13,7 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
     let frames = 0;
     let rate = 0;
     let nextTime = 0;
+    let started = false;
     let timestamp = 0;
     const flush = async (): Promise<void> => {
         if (!frames) return;
@@ -30,18 +31,24 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
         }
         frames = 0;
     };
-    const writeBlock = async (block: PackageDecodedAudioOutput): Promise<void> => {
-        const time = block.mediaTimeMicroseconds / 1e6 - start;
+    // Fill in bounded PCM batches so a late or short track never requires a gap-sized allocation.
+    const padTo = async (time: number, fallbackRate: number): Promise<void> => {
+        // Once PCM exists, continue at the decoded rate even if the container advertises a different rate.
+        rate ||= fallbackRate;
+        let remaining = Math.round((time - nextTime) * rate);
+        if (remaining <= 0) return;
+        while (remaining > 0) {
+            if (!frames) timestamp = nextTime;
+            const count = Math.min(remaining, capacity - frames);
+            pcm.fill(0, frames * channels, (frames + count) * channels);
+            frames += count;
+            nextTime += count / rate;
+            remaining -= count;
+            if (frames === capacity) await flush();
+        }
+    };
+    const copyBlock = async (block: PackageDecodedAudioOutput, skip: number, begin: number): Promise<void> => {
         const planes = prepareCustomAudioOutputChannelData(block.channelData, block.channelLayout, outputLayout);
-        // Matroska timestamps can be rounded to milliseconds. Trim real overlap even across FLAC batches.
-        const overlap = nextTime - time;
-        const skip = Math.max(0, Math.round((overlap > 0.002 ? overlap : -time) * block.sampleRate));
-        if (skip >= block.frameCount) return;
-        const first = time + skip / block.sampleRate;
-        const gap = first > nextTime + 0.002;
-        if (frames && (rate !== block.sampleRate || gap)) await flush();
-        rate = block.sampleRate;
-        const begin = gap ? first : nextTime;
         for (let i = skip; i < block.frameCount; i++) {
             if (!frames) timestamp = begin + (i - skip) / rate;
             for (let c = 0; c < channels; c++) {
@@ -50,10 +57,25 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
             }
             if (++frames === capacity) await flush();
         }
+    };
+    const writeBlock = async (block: PackageDecodedAudioOutput): Promise<void> => {
+        const time = block.mediaTimeMicroseconds / 1e6 - start;
+        // Matroska timestamps can be rounded to milliseconds. Trim real overlap even across FLAC batches.
+        const overlap = nextTime - time;
+        const skip = Math.max(0, Math.round((overlap > 0.002 ? overlap : -time) * block.sampleRate));
+        if (skip >= block.frameCount) return;
+        const first = time + skip / block.sampleRate;
+        const gap = first > nextTime + 0.002;
+        if (frames && (rate !== block.sampleRate || gap)) await flush();
+        rate = block.sampleRate;
+        if (gap && !started) await padTo(first, rate);
+        const begin = gap ? Math.max(first, nextTime) : nextTime;
+        await copyBlock(block, skip, begin);
+        started = true;
         nextTime = begin + (block.frameCount - skip) / rate;
     };
     const writeBlocks = async (blocks: readonly PackageDecodedAudioOutput[]): Promise<void> => {
         for (const block of blocks) await writeBlock(block);
     };
-    return { flush, writeBlocks };
+    return { flush, writeBlocks, padTo };
 }

@@ -32,3 +32,23 @@ it('trims seek preroll and overlapping PCM across flushes while preserving a rea
     await samples.flush();
     expect(written).toEqual([{ frames: 480, startFrame: 0 }, { frames: 720, startFrame: 480 }, { frames: 480, startFrame: 2400 }]);
 });
+
+it('writes continuous zero PCM before the first sample and after the last one', async () => {
+    const pcm = new Int16Array(36_000 * 2).fill(99);
+    let frames = 0;
+    const samples = flacSamples({ add: async (sample: AudioSample) => {
+        expect(Math.round(sample.timestamp * sample.sampleRate)).toBe(frames);
+        expect(sample.numberOfFrames).toBeLessThanOrEqual(8192);
+        sample.copyTo(pcm.subarray(frames * 2), { planeIndex: 0 });
+        frames += sample.numberOfFrames;
+    } }, 10, 'stereo');
+    await samples.padTo(0.2, 48_000);
+    await samples.writeBlocks([block(10.25, 12_000)]);
+    await samples.flush();
+    await samples.padTo(0.75, 96_000);
+    await samples.flush();
+    expect(frames).toBe(36_000);
+    expect(pcm.subarray(0, 24_000).every(value => value === 0)).toBe(true);
+    expect(pcm.subarray(24_000, 48_000).every((value, i) => value === (i % 2 ? -32768 : 32767))).toBe(true);
+    expect(pcm.subarray(48_000).every(value => value === 0)).toBe(true);
+});

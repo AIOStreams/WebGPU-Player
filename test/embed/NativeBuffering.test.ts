@@ -19,3 +19,10 @@ it('primes around the effective first keyframe when audio starts before video', 
     expect(hasStartupBuffer({ buffered, currentTime: 0.3 }, 12)).toBe(true);
     expect(hasStartupBuffer({ buffered, currentTime: 0.6 }, 12)).toBe(false);
 });
+
+it('requires a contiguous reserve covering the playhead for each active track', () => {
+    const hole = { buffered: { length: 2, start: (i: number) => [0, 4][i], end: (i: number) => [2.1, 9][i] } };
+    expect(canWaitForPlayback(9, 2, hole, bufferedTo(9))).toBe(false);
+    expect(canWaitForPlayback(9, 2.5, bufferedTo(9), hole)).toBe(false);
+    expect(canWaitForPlayback(10, 3.95, bufferedTo(9), hole)).toBe(true);
+});

@@ -72,6 +72,36 @@ function waitFor(target: EventTarget, event: string, signal: AbortSignal, action
     });
 }
 
+const bufferedStart = (buffer: SourceBuffer): number => buffer.buffered.length ? buffer.buffered.start(0) : Infinity;
+
+async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBuffer>, element: HTMLVideoElement, signal: AbortSignal) {
+    let trimThreshold = 4;
+    let keepBehind = 1.5;
+    let stalled = 0;
+    let lastTime = element.currentTime;
+    let lastStart = bufferedStart(buffer);
+    for (;;) {
+        signal.throwIfAborted();
+        if (element.currentTime - bufferedStart(buffer) > trimThreshold) {
+            await waitFor(buffer, 'updateend', signal, () => buffer.remove(0, element.currentTime - keepBehind));
+        }
+        try {
+            await waitFor(buffer, 'updateend', signal, () => buffer.appendBuffer(fragment));
+            return;
+        } catch (error) {
+            if (!(error instanceof DOMException && error.name === 'QuotaExceededError')) throw error;
+            const start = bufferedStart(buffer);
+            stalled = element.currentTime > lastTime || start > lastStart ? 0 : stalled + 1;
+            if (stalled >= 10) throw error;
+            lastTime = element.currentTime;
+            lastStart = start;
+            trimThreshold = 2;
+            keepBehind = 1;
+        }
+        await sleep(150);
+    }
+}
+
 function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, signal: AbortSignal, appended: () => void) {
     let header: Uint8Array | null = null;
     let ready = Promise.resolve();
@@ -85,22 +115,8 @@ function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, signal:
         fragment.set(data, header.byteLength);
         header = null;
         ready = ready.then(async () => {
-            let quotaFull = false;
-            for (;;) {
-                signal.throwIfAborted();
-                if (buffer.buffered.length && element.currentTime - buffer.buffered.start(0) > (quotaFull ? 2 : 4)) {
-                    await waitFor(buffer, 'updateend', signal, () => buffer.remove(0, element.currentTime - (quotaFull ? 1 : 1.5)));
-                }
-                try {
-                    await waitFor(buffer, 'updateend', signal, () => buffer.appendBuffer(fragment));
-                    appended();
-                    return;
-                } catch (error) {
-                    if (!(error instanceof DOMException && error.name === 'QuotaExceededError')) throw error;
-                    quotaFull = true;
-                    await sleep(150);
-                }
-            }
+            await appendFragment(buffer, fragment, element, signal);
+            appended();
         });
         // The packet producer awaits the same promise after each write.
         void ready.catch(() => undefined);
@@ -252,6 +268,7 @@ async function feedEpoch(
     const lookup = getAudioPrerollTimeMicroseconds(secondsToMicroseconds(start), seekPreroll[audio.softwareCodec ?? 'passthrough'], origin);
     const audioStart = await getAudioStartPacket(ar, lookup, origin);
     signal.throwIfAborted();
+    if (!audioStart) throw new Error('No audio packet');
     media.duration = source.duration;
     const videoBuffer = media.addSourceBuffer(source.videoMime);
     const audioBuffer = media.addSourceBuffer(audio.mime);
@@ -275,7 +292,11 @@ async function feedEpoch(
             decoder.setRenderTarget({ channelMask: getCustomAudioOutputChannelMask(outputLayout), binaural: false });
         }
         await Promise.all([video.output.start(), sound.output.start()]);
+        const samples = flac ? flacSamples(flac, start, outputLayout) : null;
+        const rate = samples ? await audio.track.getSampleRate() : 0;
+        const playhead = Math.max(start, target + source.origin);
         let nextVideo: EncodedPacket | null = key;
+        let videoEnd = start;
         const writeVideo = async (end: number): Promise<void> => {
             while (nextVideo && nextVideo.timestamp < end) {
                 signal.throwIfAborted();
@@ -284,44 +305,76 @@ async function feedEpoch(
                     packet.clone({ timestamp: packet.timestamp - start }),
                     packet === key ? { decoderConfig: source.config } : undefined
                 );
+                videoEnd = Math.max(videoEnd, packet.timestamp + packet.duration);
                 nextVideo = await vr.getNext(packet);
+                if (!nextVideo) await video.output.finalize();
             }
             await video.ready();
         };
-        const samples = flac ? flacSamples(flac, start, outputLayout) : null;
-        let nextAudio = audioStart;
+        let audioEnd = start;
+        let nextAudio: EncodedPacket | null = audioStart;
+        const addAudio = async (packet: EncodedPacket): Promise<void> => {
+            if (decoder && samples) {
+                await samples.writeBlocks(decoder.decode(packet.data, secondsToMicroseconds(packet.timestamp)));
+            } else if (passthrough && packet.timestamp >= start) {
+                audioEnd = Math.max(audioEnd, packet.timestamp + packet.duration);
+                await passthrough.add(
+                    packet.clone({ timestamp: packet.timestamp - start }),
+                    audio.config ? { decoderConfig: audio.config } : undefined
+                );
+            }
+        };
+        const finishAudioInput = async (): Promise<void> => {
+            if (decoder && samples) {
+                await samples.writeBlocks(decoder.drain());
+                decoder.close();
+                decoder = undefined;
+                await samples.flush();
+            } else {
+                await sound.output.finalize();
+            }
+        };
         const writeAudio = async (end: number): Promise<void> => {
-            while (nextAudio && nextAudio.timestamp < end) {
-                signal.throwIfAborted();
-                const packet: EncodedPacket = nextAudio;
-                if (decoder && samples) {
-                    await samples.writeBlocks(decoder.decode(packet.data, secondsToMicroseconds(packet.timestamp)));
-                } else if (passthrough && packet.timestamp >= start) {
-                    await passthrough.add(
-                        packet.clone({ timestamp: packet.timestamp - start }),
-                        audio.config ? { decoderConfig: audio.config } : undefined
-                    );
+            if (samples && audioStart.timestamp > start) await samples.padTo(Math.min(end, audioStart.timestamp) - start, rate);
+            while (nextAudio) {
+                if (passthrough && audioEnd === start && nextAudio.timestamp > playhead + 0.1) {
+                    throw new Error('Passthrough audio starts after the playhead');
                 }
-                nextAudio = await ar.getNext(packet);
+                if (nextAudio.timestamp >= end) break;
+                signal.throwIfAborted();
+                await addAudio(nextAudio);
+                nextAudio = await ar.getNext(nextAudio);
+                if (!nextAudio) await finishAudioInput();
             }
             await sound.ready();
         };
-        let end = start;
-        while (nextVideo || nextAudio) {
-            signal.throwIfAborted();
-            const position = Math.max(target, element.currentTime);
-            if (canWaitForPlayback(end - source.origin, position, nextVideo && videoBuffer, nextAudio && audioBuffer)) {
-                await sleep(75);
-                continue;
+        const fillAudioTail = async (end: number): Promise<void> => {
+            if (samples) {
+                // Follow the actual video packets; a long silent tail stays within the normal read-ahead.
+                await samples.padTo(Math.min(end, videoEnd) - start, rate);
+                await samples.flush();
+                await sound.ready();
+            } else if (videoEnd > audioEnd + 0.1) {
+                throw new Error('Passthrough audio ends before the video');
             }
-            end += 1;
-            await Promise.all([writeVideo(end), writeAudio(end)]);
-        }
-        if (decoder && samples) {
-            await samples.writeBlocks(decoder.drain());
-            await samples.flush();
-        }
-        await Promise.all([video.output.finalize(), sound.output.finalize()]);
+        };
+        const pumpPackets = async (): Promise<void> => {
+            let end = start;
+            while (nextVideo || nextAudio || (samples && end < videoEnd)) {
+                signal.throwIfAborted();
+                const position = Math.max(target, element.currentTime);
+                const activeAudio = nextAudio || samples ? audioBuffer : null;
+                if (canWaitForPlayback(end - source.origin, position, nextVideo && videoBuffer, activeAudio)) {
+                    await sleep(75);
+                    continue;
+                }
+                end += 1;
+                await Promise.all([writeVideo(end), writeAudio(end)]);
+                if (!nextAudio) await fillAudioTail(end);
+            }
+            if (samples) await sound.output.finalize();
+        };
+        await pumpPackets();
         await Promise.all([video.ready(), sound.ready()]);
         signal.throwIfAborted();
         media.endOfStream();
