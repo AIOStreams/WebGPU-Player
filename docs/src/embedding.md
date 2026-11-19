@@ -91,7 +91,7 @@ A Dolby Vision stream is described by its base layer.
 
 ## Native video with DTS or TrueHD audio
 
-A host with a native video element can import `NativeDtsPlayback.js` from the same directory as `EmbeddedPlayer.js`. This module runs independently of WebGPU. It reads a seekable Matroska or MP4 source, copies the encoded video to one Media Source buffer and feeds the chosen audio track to another. For DTS, DTS-HD and TrueHD that the native player cannot decode, the selected track loads its packaged audio decoder. Compatible tracks pass through. FLAC carries the decoded samples on the same media clock as the picture. A stereo destination receives a stereo downmix that includes the center channel.
+A host with a native video element can import `NativeDtsPlayback.js` from the same directory as `EmbeddedPlayer.js`. This module runs independently of WebGPU. It reads a seekable Matroska, MP4 or MPEG transport stream source, copies the encoded video to one Media Source buffer and feeds the chosen audio track to another. For DTS, DTS-HD and TrueHD that the native player cannot decode, the selected track loads its packaged audio decoder. Compatible tracks pass through. FLAC carries the decoded samples on the same media clock as the picture. A stereo destination receives a stereo downmix that includes the center channel.
 
 An optional sixth argument receives Matroska subtitle blocks with their original track numbers and times in milliseconds as the demuxer reads the video. A host that switches to direct file playback resumes its own subtitle reads.
 

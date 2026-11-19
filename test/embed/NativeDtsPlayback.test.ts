@@ -1,14 +1,22 @@
-import type { InputOptions } from 'mediabunny';
+import { MATROSKA, MPEG_TS, type InputFormat, type InputOptions } from 'mediabunny';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import { prepareNativeDtsPlayback } from 'webgpu-player/embed/NativeDtsPlayback';
 
 const opened = vi.fn<(options: InputOptions) => void>();
+const getFormat = vi.fn<() => InputFormat>(() => MATROSKA);
+const getSize = vi.fn<() => number | null>();
+const getEndTime = vi.fn<() => number>();
 
 vi.mock('mediabunny', async (original) => ({
     ...await original<typeof import('mediabunny')>(),
     Input: class {
         constructor(options: InputOptions) { opened(options); }
+
+        getFormat = getFormat;
+        source = { getSizeOrNull: getSize };
+        computeDuration = getEndTime;
+        getFirstTimestamp() { return 600; }
 
         getPrimaryVideoTrack() {
             return { getCodec: () => 'avc', getDecoderConfig: () => ({ codec: 'avc1.64001f' }) };
@@ -40,7 +48,12 @@ vi.mock('webgpu-player/decode/packages/DecoderPackage', () => ({
 }));
 vi.mock('@mediabunny/flac-encoder', () => ({ registerFlacEncoder: () => undefined }));
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+    vi.unstubAllGlobals();
+    getFormat.mockReset();
+    getSize.mockReset();
+    getEndTime.mockReset();
+});
 
 it('keeps the original audio ordinals when a native TV cannot play the default track', async () => {
     vi.stubGlobal('MediaSource', { isTypeSupported: (mime: string) => !['mlpa', 'vorbis', 'dtsl'].some(codec => mime.includes(codec)) });
@@ -106,6 +119,32 @@ it('forwards timed subtitle bytes without retaining the cluster or dispatching a
         owner.abort();
         report!(block);
         expect(subtitles).toHaveBeenCalledTimes(2);
+    } finally {
+        owner.abort();
+    }
+});
+
+it('only reads the end of a finite transport stream and requires playable time after its program clock origin', async () => {
+    getFormat.mockReturnValue(MPEG_TS);
+    getSize.mockReturnValueOnce(null).mockReturnValue(188_000);
+    getEndTime.mockReturnValueOnce(599).mockReturnValue(625);
+    vi.stubGlobal('MediaSource', { isTypeSupported: () => true });
+    vi.stubGlobal('AudioContext', class {
+        destination = { maxChannelCount: 2 };
+        close = vi.fn();
+    });
+    // eslint-disable-next-line compat/compat -- The native playback path requires AbortController.
+    const owner = new AbortController();
+    try {
+        const video = document.createElement('video');
+        const open = () => prepareNativeDtsPlayback(video, 'https://example.test/film.m2ts', {}, owner.signal, vi.fn());
+        expect(await open()).toBeNull();
+        expect(getEndTime).not.toHaveBeenCalled();
+        expect(await open()).toBeNull();
+        const player = await open();
+        expect(opened.mock.lastCall?.[0].formats).toContain(MPEG_TS);
+        expect(player?.tracks.map(({ codec }) => codec)).toContain('dts');
+        expect(getEndTime).toHaveBeenCalledTimes(2);
     } finally {
         owner.abort();
     }

@@ -9,6 +9,7 @@ import {
     Input,
     MATROSKA,
     MP4,
+    MPEG_TS,
     Mp4OutputFormat,
     NullTarget,
     Output,
@@ -31,7 +32,8 @@ import {
     TRUEHD_MAJOR_SYNC_PREROLL_MICROSECONDS
 } from '../demux/AudioStartPacket';
 import { isDTSExpressTrack } from '../demux/CustomAudioTrackMetadata';
-import { secondsToMicroseconds } from '../MediaTime';
+import { readPlaybackTimelineOriginMicroseconds } from '../demux/PlaybackTimelineOrigin';
+import { microsecondsToSeconds, secondsToMicroseconds } from '../MediaTime';
 import { canWaitForPlayback } from './NativeBuffering';
 import type { ContainerSubtitleBlock } from '../pipeline/DecodeWorkerProtocol';
 
@@ -185,6 +187,7 @@ type NativeSource = {
     videoMime: string;
     dolbyVisionConfig?: Uint8Array;
     duration: number;
+    origin: number;
 };
 
 function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'], config: VideoDecoderConfig) {
@@ -262,19 +265,20 @@ async function feedEpoch(
     const { media, signal, appended } = session;
     const vr = new PacketReader(source.video);
     const ar = new PacketReader(audio.track);
-    const key = (await vr.getKeyAt(target)) ?? (await vr.getFirstKey());
+    const key = (await vr.getKeyAt(target + source.origin)) ?? (await vr.getFirstKey());
     if (!key) throw new Error('No video keyframe');
     const start = key.timestamp;
-    const origin = secondsToMicroseconds(0);
+    const origin = secondsToMicroseconds(source.origin);
     const lookup = getAudioPrerollTimeMicroseconds(secondsToMicroseconds(start), seekPreroll[audio.softwareCodec ?? 'passthrough'], origin);
     const audioStart = await getAudioStartPacket(ar, lookup, origin);
     signal.throwIfAborted();
     media.duration = source.duration;
     const videoBuffer = media.addSourceBuffer(source.videoMime);
     const audioBuffer = media.addSourceBuffer(audio.mime);
-    videoBuffer.timestampOffset = start;
-    audioBuffer.timestampOffset = start;
-    element.currentTime = Math.max(start, target);
+    const playbackStart = start - source.origin;
+    videoBuffer.timestampOffset = playbackStart;
+    audioBuffer.timestampOffset = playbackStart;
+    element.currentTime = Math.max(playbackStart, target);
     const video = fragmentOutput(videoBuffer, element, signal, appended);
     const sound = fragmentOutput(audioBuffer, element, signal, appended);
     const picture = new EncodedVideoPacketSource(source.codec);
@@ -326,7 +330,7 @@ async function feedEpoch(
         while (nextVideo || nextAudio) {
             signal.throwIfAborted();
             const position = Math.max(target, element.currentTime);
-            if (canWaitForPlayback(end, position, nextVideo && videoBuffer, nextAudio && audioBuffer)) {
+            if (canWaitForPlayback(end - source.origin, position, nextVideo && videoBuffer, nextAudio && audioBuffer)) {
                 await sleep(75);
                 continue;
             }
@@ -360,7 +364,7 @@ export async function prepareNativeDtsPlayback(
     const { MediaSource: NativeMediaSource, AudioContext: NativeAudioContext, AbortController: NativeAbortController } = globalThis;
     if (!NativeMediaSource.isTypeSupported(FLAC_MIME)) return null;
     const input = new Input({
-        formats: [MATROSKA, MP4],
+        formats: [MATROSKA, MP4, MPEG_TS],
         formatOptions: onSubtitleBlocks ? {
             matroska: {
                 onOtherTrackBlock(block) {
@@ -401,15 +405,21 @@ export async function prepareNativeDtsPlayback(
         if (!video) return null;
         const tracks = await Promise.all((await input.getAudioTracks()).map((track) => audioChoice(track, element)));
         if (!tracks.some((track) => track?.softwareCodec)) return null;
-        const [codec, config, duration] = await Promise.all([
+        const isTransportStream = await input.getFormat() === MPEG_TS;
+        if (isTransportStream && await input.source.getSizeOrNull() === null) return null;
+        const playableTracks = [video, ...tracks.flatMap((audio) => audio ? [audio.track] : [])];
+        const [codec, config, end, originTime] = await Promise.all([
             video.getCodec(),
             video.getDecoderConfig(),
-            input.getDurationFromMetadata()
+            isTransportStream ? input.computeDuration(playableTracks, { skipLiveWait: true }) : input.getDurationFromMetadata(),
+            readPlaybackTimelineOriginMicroseconds(input, playableTracks)
         ]);
-        if (!codec || !config || !duration || !Number.isFinite(duration)) return null;
+        const origin = microsecondsToSeconds(originTime);
+        const duration = (end ?? 0) - origin;
+        if (!codec || !config || !Number.isFinite(duration) || duration <= 0) return null;
         const format = nativeVideoFormat(video, codec, config);
         if (!format) return null;
-        const source: NativeSource = { video, codec, config, duration, ...format };
+        const source: NativeSource = { video, codec, config, duration, origin, ...format };
         owner.throwIfAborted();
         let selected = tracks.findIndex((track) => track?.isDefault);
         if (selected < 0) selected = tracks.findIndex((track) => track !== null);
