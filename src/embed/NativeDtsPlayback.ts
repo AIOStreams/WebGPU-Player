@@ -14,6 +14,7 @@ import {
     NullTarget,
     Output,
     PacketReader,
+    QTFF,
     UrlSource,
     type EncodedPacket,
     type InputAudioTrack,
@@ -364,7 +365,7 @@ export async function prepareNativeDtsPlayback(
     const { MediaSource: NativeMediaSource, AudioContext: NativeAudioContext, AbortController: NativeAbortController } = globalThis;
     if (!NativeMediaSource.isTypeSupported(FLAC_MIME)) return null;
     const input = new Input({
-        formats: [MATROSKA, MP4, MPEG_TS],
+        formats: [MATROSKA, MP4, QTFF, MPEG_TS],
         formatOptions: onSubtitleBlocks ? {
             matroska: {
                 onOtherTrackBlock(block) {
