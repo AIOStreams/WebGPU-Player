@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native audio remux browser tests</title>
+<!-- Serve the repository root over localhost after building the production embedding module. -->
+<video muted playsinline></video>
+<pre id="result">Running</pre>
+<script type="module">
+import { prepareNativeDtsPlayback } from '../../bin/libraries/webgpu-player/NativeDtsPlayback.js';
+
+const video = document.querySelector('video');
+const result = document.querySelector('#result');
+
+async function play(file, remux, duration = 1.2) {
+    const url = new URL('fixtures/' + file, location.href).href;
+    const owner = new AbortController();
+    let timeout;
+    try {
+        const finished = new Promise((resolve, reject) => {
+            video.addEventListener('ended', resolve, { once: true, signal: owner.signal });
+            video.addEventListener('error', () => reject(new Error(video.error.message)), { signal: owner.signal });
+            timeout = setTimeout(() => reject(new Error('Playback timed out')), (duration + 8) * 1000);
+            video.autoplay = true;
+            if (remux) {
+                prepareNativeDtsPlayback(video, url, {}, owner.signal, reject).then(player => {
+                    if (!player) throw new Error('Remux declined');
+                    player.start(0);
+                }).catch(reject);
+            } else {
+                video.src = url;
+            }
+        });
+        await finished;
+        if (Math.abs(video.currentTime - duration) > 0.02) throw new Error('Playback ended at ' + video.currentTime);
+        const canvas = document.createElement('canvas');
+        canvas.width = 2;
+        canvas.height = 2;
+        const context = canvas.getContext('2d');
+        context.drawImage(video, 0, 0, 2, 2);
+        const pixels = context.getImageData(0, 0, 2, 2).data;
+        return [0, 4, 8, 12].map(offset => {
+            const rgb = pixels.slice(offset, offset + 3);
+            return ['red', 'green', 'blue'][rgb.indexOf(Math.max(...rgb))];
+        }).join(' ');
+    } finally {
+        clearTimeout(timeout);
+        owner.abort();
+        video.removeAttribute('src');
+        video.load();
+    }
+}
+
+async function checkSampleRate() {
+    // This MKV advertises 44.1 kHz. Its first 48 kHz DTS packet starts at 50 ms.
+    let sampleRate;
+    const original = SourceBuffer.prototype.appendBuffer;
+    SourceBuffer.prototype.appendBuffer = function (data) {
+        if (sampleRate === undefined) {
+            const bytes = new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength);
+            const box = new TextDecoder('latin1').decode(bytes).indexOf('dfLa');
+            // FLACSpecificBox version/flags, metadata-block header, then STREAMINFO's 20-bit sample rate.
+            if (box >= 0) sampleRate = new DataView(bytes.buffer, bytes.byteOffset).getUint32(box + 22) >>> 12;
+        }
+        return original.call(this, data);
+    };
+    try {
+        await play('late-48k-dts.mkv', true);
+        if (sampleRate !== 48000) throw new Error('FLAC sample rate was ' + sampleRate);
+    } finally {
+        SourceBuffer.prototype.appendBuffer = original;
+    }
+}
+
+async function checkMirror() {
+    // Static red/green on the encoded left and blue on the right, with a horizontal MOV display flip.
+    const direct = await play('mirrored.mov', false);
+    const remuxed = await play('mirrored.mov', true);
+    if (direct !== 'blue red blue green') throw new Error('Direct playback did not display the flipped reference');
+    if (remuxed !== direct) throw new Error('Remux displayed ' + remuxed);
+}
+
+async function checkLongGop() {
+    // H.264 with keyframes ten seconds apart. The audio clock can reach EOF while the picture is frozen.
+    let lastFrame = 0;
+    let callback;
+    function presented(_, { mediaTime }) {
+        lastFrame = mediaTime;
+        callback = video.requestVideoFrameCallback(presented);
+    }
+    callback = video.requestVideoFrameCallback(presented);
+    try {
+        video.playbackRate = 2;
+        await play('long-gop.mkv', true, 30.6);
+        if (lastFrame < 30) throw new Error('Last presented frame was at ' + lastFrame);
+    } finally {
+        video.cancelVideoFrameCallback(callback);
+        video.playbackRate = 1;
+    }
+}
+
+const reports = [];
+for (const check of [checkSampleRate, checkMirror, checkLongGop]) {
+    try {
+        await check();
+        reports.push(check.name + ' passed');
+    } catch (error) {
+        reports.push(check.name + ' failed: ' + error.message);
+    }
+}
+result.textContent = reports.join('\n');
+result.dataset.status = reports.every(line => line.endsWith(' passed')) ? 'passed' : 'failed';
+</script>

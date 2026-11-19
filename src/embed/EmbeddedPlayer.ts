@@ -53,11 +53,11 @@ import type { PlanReport } from '../presentation/passes/PassTypes';
 import WebGPUPresenter, { type PresentationFallbackReason, type PresentationPresetFile, type PresentationSurface, type PresentedPicture } from '../presentation/WebGPUPresenter';
 import canvasStyles from '../style.css';
 import { requireMicroseconds } from '../TimeMath';
+import { decoderPackageURL, hasDecoderPackage } from './DecoderPackageAssets';
 import { describeSource, type DescribedSource, type DescribedStream } from './DescribeSource';
 
 // Defined by the build
 declare const __WEBGPU_PLAYER_ASSET_KEY__: string;
-declare const __WEBGPU_PLAYER_DECODER_PACKAGES__: readonly string[];
 
 const DIRECT_PLAY_METHOD = 'DirectPlay';
 const MICROSECONDS_PER_MILLISECOND = 1000;
@@ -179,10 +179,10 @@ export async function warmUp(isPlaybackActive: () => boolean): Promise<void> {
         if (!warmCustomDecodeCapabilities()) {
             return;
         }
-        const names = WARM_VIDEO_PACKAGES.filter((name: string): boolean => __WEBGPU_PLAYER_DECODER_PACKAGES__.includes(`${name}.wasm`));
+        const names = WARM_VIDEO_PACKAGES.filter(hasDecoderPackage);
         const cached = await Promise.all(names.map(async (name: string): Promise<boolean> => (
             ALWAYS_WARMED_PACKAGES.includes(name)
-            || (await fetch(packageURL(name), { cache: 'only-if-cached', mode: 'same-origin' }).catch((): null => null))?.ok === true
+            || (await fetch(decoderPackageURL(name), { cache: 'only-if-cached', mode: 'same-origin' }).catch((): null => null))?.ok === true
         )));
         const loaded = await Promise.all(names.filter((_name: string, index: number): boolean => cached[index]).map(loadPackage));
         const video = loaded.filter((loadedPackage: LoadedPackage): loadedPackage is VideoDecoderPackage => loadedPackage?.kind === 'video');
@@ -241,13 +241,11 @@ const PACKAGE_OF_CODEC: Readonly<Record<string, string>> = {
 
 const loadedPackages = new Map<string, Promise<LoadedPackage>>();
 
-const packageURL = (name: string): URL => new URL(`../wgpud/${name}.wasm?v=${__WEBGPU_PLAYER_ASSET_KEY__}`, import.meta.url);
-
 /** Null for a package that fails to load. */
 function loadPackage(name: string): Promise<LoadedPackage> {
     let loading = loadedPackages.get(name);
     if (!loading) {
-        loading = fetch(packageURL(name))
+        loading = fetch(decoderPackageURL(name))
             .then(async (response: Response): Promise<LoadedPackage> => (response.ok ? loadDecoderPackage(await response.arrayBuffer()) : null))
             .catch((): null => null);
         loadedPackages.set(name, loading);
@@ -258,7 +256,7 @@ function loadPackage(name: string): Promise<LoadedPackage> {
 async function packagesFor(source: DescribedSource): Promise<DecoderPackages> {
     const names = new Set(source.MediaStreams
         .map((stream: DescribedStream): string | undefined => PACKAGE_OF_CODEC[stream.Codec ?? ''])
-        .filter((name: string | undefined): name is string => !!name && __WEBGPU_PLAYER_DECODER_PACKAGES__.includes(`${name}.wasm`)));
+        .filter((name: string | undefined): name is string => !!name && hasDecoderPackage(name)));
     const loaded = await Promise.all([ ...names ].map(loadPackage));
     return {
         audio: loaded.filter((loadedPackage: LoadedPackage): loadedPackage is AudioDecoderPackage => loadedPackage?.kind === 'audio'),
