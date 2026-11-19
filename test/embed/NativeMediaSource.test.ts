@@ -9,14 +9,15 @@ import { prepareNativeDtsPlayback } from 'webgpu-player/embed/NativeDtsPlayback'
 type Span = [number, number];
 const duration = 14;
 const sampleRate = 48_000;
-const packet = (time: number) => new EncodedPacket(new Uint8Array(1), 'key', time, 1);
+const packet = (time: number, key = true) => new EncodedPacket(new Uint8Array(1), key ? 'key' : 'delta', time, 1);
 const ranges = (spans: Span[]) => ({ length: spans.length, start: (i: number) => spans[i][0], end: (i: number) => spans[i][1] });
-const fixture = { first: 0, end: duration, limit: 6, quota: 'none' as 'none' | 'full' | 'recover' };
+const fixture = { first: 0, end: duration, limit: 6, gop: 1, quota: 'none' as 'none' | 'full' | 'recover' };
 const matrix = [-1, 0, 0, 0, 1, 0, 320, 0, 1];
 const metadata = vi.fn<(options: VideoTrackMetadata) => void>();
 const soundEnd = vi.fn();
 let rejections = 0;
 let removals = 0;
+const videoRemovals = vi.fn();
 
 class BufferDouble extends EventTarget {
     spans: Span[] = [];
@@ -40,6 +41,10 @@ class BufferDouble extends EventTarget {
     }
     remove(_start: number, end: number) {
         removals++;
+        if (this.video) {
+            videoRemovals(end);
+            end = Math.ceil(end / fixture.gop) * fixture.gop;
+        }
         this.spans = this.spans.filter(s => s[1] > end).map(s => [Math.max(s[0], end), s[1]]);
         void Promise.resolve().then(() => this.dispatchEvent(new Event('updateend')));
     }
@@ -63,8 +68,11 @@ class MediaDouble extends EventTarget {
 }
 
 class MuxTrack {
-    write!: (span: Span) => void;
-    async add(sample: EncodedPacket | AudioSample) { this.write([sample.timestamp, sample.timestamp + sample.duration]); }
+    write!: (span: Span, key: boolean) => void;
+    async add(sample: EncodedPacket | AudioSample) {
+        const key = !(sample instanceof EncodedPacket) || sample.type === 'key';
+        this.write([sample.timestamp, sample.timestamp + sample.duration], key);
+    }
 }
 
 class MuxDouble {
@@ -80,8 +88,8 @@ class MuxDouble {
         this.pending = null;
     }
     private connect(track: MuxTrack) {
-        track.write = ([start, end]) => {
-            if (this.pending && (start - this.pending[0] >= 1 - 1e-5 || start > this.pending[1] + 1e-5)) this.emit();
+        track.write = ([start, end], key) => {
+            if (key && this.pending && (start - this.pending[0] >= 1 - 1e-5 || start > this.pending[1] + 1e-5)) this.emit();
             this.pending = this.pending ? [this.pending[0], end] : [start, end];
         };
     }
@@ -120,12 +128,13 @@ vi.mock('mediabunny', async (original) => ({
     PacketReader: class {
         constructor(private track: { video?: boolean }) {}
         getFirstKey() { return packet(0); }
-        getKeyAt(t: number) { return packet(Math.floor(t)); }
+        getKeyAt(t: number) { return packet(Math.floor(t / fixture.gop) * fixture.gop); }
         getFirst() { return packet(this.track.video ? 0 : fixture.first); }
         getAt(t: number) { return t < fixture.first ? null : packet(Math.min(fixture.end - 1, Math.floor(t))); }
         getNext(p: EncodedPacket) {
             const end = this.track.video ? duration : fixture.end;
-            return p.timestamp + 1 < end ? packet(p.timestamp + 1) : null;
+            const time = p.timestamp + 1;
+            return time < end ? packet(time, !this.track.video || time % fixture.gop === 0) : null;
         }
     },
     Output: class { constructor(options: ConstructorParameters<typeof MuxDouble>[0]) { return new MuxDouble(options); } },
@@ -149,7 +158,7 @@ vi.mock('webgpu-player/decode/audio/PackageSoftwareAudioDecoder', () => ({
 let media: MediaDouble;
 beforeEach(() => {
     vi.useFakeTimers();
-    Object.assign(fixture, { first: 0, end: duration, limit: 6, quota: 'none' });
+    Object.assign(fixture, { first: 0, end: duration, limit: 6, gop: 1, quota: 'none' });
     rejections = removals = 0;
     vi.stubGlobal('MediaSource', MediaDouble);
     vi.stubGlobal('URL', class extends URL {
@@ -217,6 +226,12 @@ it.each([{ first: 2, end: duration }, { first: 0, end: 4 }])('signals fallback f
     Object.assign(fixture, span);
     expect((await run(1)).errors).toHaveLength(1);
     if (span.first === 0) expect(soundEnd).toHaveBeenCalledOnce();
+});
+it('keeps the first 10-second GOP buffered while playing at second 8', async () => {
+    fixture.gop = 10;
+    expect(await run()).toMatchObject({ errors: [], ended: true, time: duration });
+    expect(videoRemovals).not.toHaveBeenCalled();
+    expect(removals).toBeGreaterThan(0); // Audio can still trim inside the GOP.
 });
 it('rejects a fragment that never fits during priming', async () => {
     fixture.quota = 'full';

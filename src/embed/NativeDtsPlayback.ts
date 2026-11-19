@@ -76,7 +76,20 @@ type Epoch = { media: MediaSource; signal: AbortSignal; appended(): void; intent
 
 const bufferedStart = (buffer: SourceBuffer): number => buffer.buffered.length ? buffer.buffered.start(0) : Infinity;
 
-async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBuffer>, element: HTMLVideoElement, epoch: Epoch) {
+function trimBackBuffer(buffer: SourceBuffer, position: number, threshold: number, keepBehind: number, signal: AbortSignal, keyframes?: number[]) {
+    const start = bufferedStart(buffer);
+    if (position - start <= threshold) return;
+    const cutoff = position - keepBehind;
+    let end = cutoff;
+    if (keyframes) {
+        // MSE also evicts dependent frames up to the next keyframe. Leave a millisecond for MP4 timestamp rounding.
+        end = 0;
+        while (keyframes.length && keyframes[0] <= cutoff) end = keyframes.shift()! - 0.001;
+    }
+    if (end > start) return waitFor(buffer, 'updateend', signal, () => buffer.remove(0, end));
+}
+
+async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBuffer>, element: HTMLVideoElement, epoch: Epoch, keyframes?: number[]) {
     const { signal } = epoch;
     let trimThreshold = 4;
     let keepBehind = 1.5;
@@ -85,9 +98,7 @@ async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBu
     let lastStart = bufferedStart(buffer);
     for (;;) {
         signal.throwIfAborted();
-        if (element.currentTime - bufferedStart(buffer) > trimThreshold) {
-            await waitFor(buffer, 'updateend', signal, () => buffer.remove(0, element.currentTime - keepBehind));
-        }
+        await trimBackBuffer(buffer, element.currentTime, trimThreshold, keepBehind, signal, keyframes);
         let quotaError: DOMException;
         try {
             await waitFor(buffer, 'updateend', signal, () => buffer.appendBuffer(fragment));
@@ -112,7 +123,7 @@ async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBu
     }
 }
 
-function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, epoch: Epoch) {
+function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, epoch: Epoch, keyframes?: number[]) {
     let header: Uint8Array | null = null;
     let ready = Promise.resolve();
     const first = (data: Uint8Array): void => {
@@ -125,7 +136,7 @@ function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, epoch: 
         fragment.set(data, header.byteLength);
         header = null;
         ready = ready.then(async () => {
-            await appendFragment(buffer, fragment, element, epoch);
+            await appendFragment(buffer, fragment, element, epoch, keyframes);
             epoch.appended();
         });
         // The packet producer awaits the same promise after each write.
@@ -305,7 +316,8 @@ async function feedEpoch(
     videoBuffer.timestampOffset = playbackStart;
     audioBuffer.timestampOffset = playbackStart;
     element.currentTime = Math.max(playbackStart, target);
-    const video = fragmentOutput(videoBuffer, element, session);
+    const keyframes: number[] = [];
+    const video = fragmentOutput(videoBuffer, element, session, keyframes);
     const sound = fragmentOutput(audioBuffer, element, session);
     const picture = new EncodedVideoPacketSource(source.codec);
     video.output.addVideoTrack(picture, { transformationMatrix: source.transformationMatrix, dolbyVisionConfig: source.dolbyVisionConfig });
@@ -333,6 +345,7 @@ async function feedEpoch(
             while (nextVideo && nextVideo.timestamp < end) {
                 signal.throwIfAborted();
                 const packet: EncodedPacket = nextVideo;
+                if (packet.type === 'key') keyframes.push(packet.timestamp - source.origin);
                 await picture.add(
                     packet.clone({ timestamp: packet.timestamp - start }),
                     packet === key ? { decoderConfig: source.config } : undefined

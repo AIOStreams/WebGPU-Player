@@ -10,7 +10,7 @@ import { prepareNativeDtsPlayback } from '../../bin/libraries/webgpu-player/Nati
 const video = document.querySelector('video');
 const result = document.querySelector('#result');
 
-async function play(file, remux) {
+async function play(file, remux, duration = 1.2) {
     const url = new URL('fixtures/' + file, location.href).href;
     const owner = new AbortController();
     let timeout;
@@ -18,7 +18,7 @@ async function play(file, remux) {
         const finished = new Promise((resolve, reject) => {
             video.addEventListener('ended', resolve, { once: true, signal: owner.signal });
             video.addEventListener('error', () => reject(new Error(video.error.message)), { signal: owner.signal });
-            timeout = setTimeout(() => reject(new Error('Playback timed out')), 8000);
+            timeout = setTimeout(() => reject(new Error('Playback timed out')), (duration + 8) * 1000);
             video.autoplay = true;
             if (remux) {
                 prepareNativeDtsPlayback(video, url, {}, owner.signal, reject).then(player => {
@@ -30,7 +30,7 @@ async function play(file, remux) {
             }
         });
         await finished;
-        if (Math.abs(video.currentTime - 1.2) > 0.02) throw new Error('Playback ended at ' + video.currentTime);
+        if (Math.abs(video.currentTime - duration) > 0.02) throw new Error('Playback ended at ' + video.currentTime);
         const canvas = document.createElement('canvas');
         canvas.width = 2;
         canvas.height = 2;
@@ -78,8 +78,27 @@ async function checkMirror() {
     if (remuxed !== direct) throw new Error('Remux displayed ' + remuxed);
 }
 
+async function checkLongGop() {
+    // H.264 with keyframes ten seconds apart. The audio clock can reach EOF while the picture is frozen.
+    let lastFrame = 0;
+    let callback;
+    function presented(_, { mediaTime }) {
+        lastFrame = mediaTime;
+        callback = video.requestVideoFrameCallback(presented);
+    }
+    callback = video.requestVideoFrameCallback(presented);
+    try {
+        video.playbackRate = 2;
+        await play('long-gop.mkv', true, 30.6);
+        if (lastFrame < 30) throw new Error('Last presented frame was at ' + lastFrame);
+    } finally {
+        video.cancelVideoFrameCallback(callback);
+        video.playbackRate = 1;
+    }
+}
+
 const reports = [];
-for (const check of [checkSampleRate, checkMirror]) {
+for (const check of [checkSampleRate, checkMirror, checkLongGop]) {
     try {
         await check();
         reports.push(check.name + ' passed');
