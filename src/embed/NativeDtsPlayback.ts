@@ -1,7 +1,6 @@
 // Remux the original video and the selected audio track onto the same native media clock.
 import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 import {
-    AudioSample,
     AudioSampleSource,
     EncodedAudioPacketSource,
     EncodedVideoPacketSource,
@@ -22,7 +21,6 @@ import {
 } from 'mediabunny';
 
 import { isSupportedTrueHDInputRoute } from '../audio/CustomCompressedAudioRoute';
-import { prepareCustomAudioOutputChannelData } from '../audio/processing/CustomAudioChannelLayout';
 import { getCustomAudioOutputChannelMask } from '../audio/processing/CustomWaveChannelLayout';
 import PackageSoftwareAudioDecoder from '../decode/audio/PackageSoftwareAudioDecoder';
 import { loadDecoderPackage, type AudioDecoderPackage } from '../decode/packages/DecoderPackage';
@@ -32,10 +30,13 @@ import {
     getAudioStartPacket,
     TRUEHD_MAJOR_SYNC_PREROLL_MICROSECONDS
 } from '../demux/AudioStartPacket';
+import { MediaHTTPError } from '../demux/MediaFetchPolicy';
 import { isDTSExpressTrack } from '../demux/CustomAudioTrackMetadata';
 import { readPlaybackTimelineOriginMicroseconds } from '../demux/PlaybackTimelineOrigin';
 import { microsecondsToSeconds, secondsToMicroseconds } from '../MediaTime';
-import { canWaitForPlayback } from './NativeBuffering';
+import { decoderPackageURL, hasDecoderPackage } from './DecoderPackageAssets';
+import { flacSamples } from './NativeFlacSamples';
+import { canWaitForPlayback, hasStartupBuffer } from './NativeBuffering';
 import type { ContainerSubtitleBlock } from '../pipeline/DecodeWorkerProtocol';
 
 const FLAC_MIME = 'audio/mp4; codecs="flac"';
@@ -150,6 +151,7 @@ async function audioChoice(track: InputAudioTrack, element: HTMLVideoElement): P
         if (!isSupportedTrueHDInputRoute(codec, channels, await track.getSampleRate())) return null;
         softwareCodec = codec;
     }
+    if (softwareCodec && !hasDecoderPackage(softwareCodec)) return null;
     const mime = softwareCodec ? FLAC_MIME : nativeMime;
     if (!softwareCodec && !canPass) return null;
     return {
@@ -168,7 +170,7 @@ async function audioChoice(track: InputAudioTrack, element: HTMLVideoElement): P
 const decoderPackages: Partial<Record<SoftwareCodec, Promise<AudioDecoderPackage>>> = {};
 function loadAudioDecoder(codec: SoftwareCodec): Promise<AudioDecoderPackage> {
     decoderPackages[codec] ??= (async () => {
-        const response = await fetch(new URL(`../wgpud/${codec}.wasm`, import.meta.url));
+        const response = await fetch(decoderPackageURL(codec));
         if (!response.ok && response.status !== 0) throw new Error(`${codec} decoder unavailable`);
         const pkg = await loadDecoderPackage(await response.arrayBuffer());
         if (pkg.kind !== 'audio') throw new Error(`Invalid ${codec} decoder package`);
@@ -200,57 +202,6 @@ function nativeVideoFormat(video: InputVideoTrack, codec: NativeSource['codec'],
     }
     const videoMime = `video/mp4; codecs="${config.codec}"`;
     return MediaSource.isTypeSupported(videoMime) ? { videoMime } : null;
-}
-
-function flacSamples(flac: AudioSampleSource, start: number, outputLayout: 'stereo' | '5.1') {
-    // Each AudioSample sent to the FLAC worker carries several decoded blocks.
-    const channels = outputLayout === '5.1' ? 6 : 2;
-    const capacity = 8192;
-    const stereo = outputLayout === 'stereo';
-    const pcm = stereo ? new Int16Array(capacity * channels) : new Float32Array(capacity * channels);
-    let frames = 0;
-    let rate = 0;
-    let timestamp = 0;
-    const flush = async (): Promise<void> => {
-        if (!frames) return;
-        const sample = new AudioSample({
-            data: pcm.slice(0, frames * channels),
-            format: stereo ? 's16' : 'f32',
-            sampleRate: rate,
-            numberOfChannels: channels,
-            timestamp
-        });
-        try {
-            await flac.add(sample);
-        } finally {
-            sample.close();
-        }
-        frames = 0;
-    };
-    type DecodedBlock = ReturnType<PackageSoftwareAudioDecoder['decode']>[number];
-    const writeBlock = async (block: DecodedBlock): Promise<void> => {
-        const time = block.mediaTimeMicroseconds / 1e6 - start;
-        const planes = prepareCustomAudioOutputChannelData(block.channelData, block.channelLayout, outputLayout);
-        const skip = Math.max(0, Math.round(-time * block.sampleRate));
-        if (skip >= block.frameCount) return;
-        if (
-            frames
-            && (rate !== block.sampleRate || Math.abs(time + skip / block.sampleRate - (timestamp + frames / rate)) > 0.002)
-        ) { await flush(); }
-        rate = block.sampleRate;
-        for (let i = skip; i < block.frameCount; i++) {
-            if (!frames) timestamp = Math.max(0, time + i / rate);
-            for (let c = 0; c < channels; c++) {
-                const sample = planes[c][i];
-                pcm[frames * channels + c] = stereo ? Math.max(-32768, Math.min(32767, Math.round(sample * 32768))) : sample;
-            }
-            if (++frames === capacity) await flush();
-        }
-    };
-    const writeBlocks = async (blocks: readonly DecodedBlock[]): Promise<void> => {
-        for (const block of blocks) await writeBlock(block);
-    };
-    return { flush, writeBlocks };
 }
 
 // An epoch owns its muxers, decoder, SourceBuffers and object URL. A seek outside the buffer or an audio
@@ -364,6 +315,31 @@ export async function prepareNativeDtsPlayback(
     if (!('MediaSource' in globalThis && 'AudioContext' in globalThis && 'AbortController' in globalThis)) return null;
     const { MediaSource: NativeMediaSource, AudioContext: NativeAudioContext, AbortController: NativeAbortController } = globalThis;
     if (!NativeMediaSource.isTypeSupported(FLAC_MIME)) return null;
+    let retained = false;
+    let retries = 0;
+    const urlSource = new UrlSource(url, {
+        requestInit: { headers },
+        maxCacheSize: 12 * 1024 * 1024,
+        async fetchFn(input, init) {
+            const response = await fetch(input, init);
+            if (!response.ok && retained) {
+                const error = new MediaHTTPError(response.status);
+                if (error.retryable) {
+                    void response.body?.cancel().catch(() => undefined);
+                    throw error;
+                }
+            }
+            return response;
+        },
+        getRetryDelay(attempt) {
+            // A broken response body can restart at the same byte, resetting Mediabunny's attempt count.
+            if (!retained || owner.aborted || attempt > 2 || retries >= 2) return null;
+            return 0.25 * 2 ** retries++;
+        }
+    });
+    urlSource.on('read', ({ start, end }) => {
+        if (end > start) retries = 0;
+    });
     const input = new Input({
         formats: [MATROSKA, MP4, QTFF, MPEG_TS],
         formatOptions: onSubtitleBlocks ? {
@@ -380,31 +356,31 @@ export async function prepareNativeDtsPlayback(
                 }
             }
         } : undefined,
-        source: new UrlSource(url, {
-            requestInit: { headers },
-            maxCacheSize: 12 * 1024 * 1024,
-            getRetryDelay: () => null
-        })
+        source: urlSource
     });
     let epoch: AbortController | undefined;
     let objectURL: string | undefined;
+    let paused = true;
+    let priming = true;
     const release = (): void => {
         epoch?.abort();
         if (objectURL) URL.revokeObjectURL(objectURL);
         objectURL = undefined;
     };
     const destroy = (): void => {
+        if (epoch) element.autoplay = priming ? !paused : !element.paused;
+        retained = false;
         release();
+        epoch = undefined;
         owner.removeEventListener('abort', destroy);
         input.dispose();
     };
     owner.addEventListener('abort', destroy, { once: true });
-    let retained = false;
     try {
         owner.throwIfAborted();
         const video = await input.getPrimaryVideoTrack();
         if (!video) return null;
-        const tracks = await Promise.all((await input.getAudioTracks()).map((track) => audioChoice(track, element)));
+        const tracks = await Promise.all((await input.getAudioTracks()).map((track) => audioChoice(track, element).catch(() => null)));
         if (!tracks.some((track) => track?.softwareCodec)) return null;
         const isTransportStream = await input.getFormat() === MPEG_TS;
         if (isTransportStream && await input.source.getSizeOrNull() === null) return null;
@@ -433,8 +409,7 @@ export async function prepareNativeDtsPlayback(
             await context.close();
         }
         owner.throwIfAborted();
-        let paused = !element.autoplay;
-        let priming = true;
+        paused = !element.autoplay;
         const setPaused = (value: boolean): void => {
             paused = value;
             if (paused) element.pause();
@@ -444,6 +419,8 @@ export async function prepareNativeDtsPlayback(
             const target = Math.max(0, Math.min(duration, seconds));
             const audio = tracks[ordinal];
             if (!audio || owner.aborted) return;
+            if (epoch && !priming) paused = element.paused;
+            const rate = element.playbackRate;
             release();
             selected = ordinal;
             epoch = new NativeAbortController();
@@ -453,15 +430,7 @@ export async function prepareNativeDtsPlayback(
             element.autoplay = false;
             const appended = (): void => {
                 if (!priming || signal.aborted) return;
-                const ranges = element.buffered;
-                for (let i = 0; i < ranges.length; i++) {
-                    if (ranges.start(i) <= target + 0.1 && ranges.end(i) >= Math.min(duration - 0.05, target + 2)) {
-                        priming = false;
-                        setPaused(paused);
-                        return;
-                    }
-                }
-                if (media.readyState === 'ended') {
+                if (hasStartupBuffer(element, duration) || media.readyState === 'ended') {
                     priming = false;
                     setPaused(paused);
                 }
@@ -470,16 +439,18 @@ export async function prepareNativeDtsPlayback(
             const open = waitFor(media, 'sourceopen', signal);
             element.src = objectURL;
             void open
-                .then(() =>
-                    feedEpoch(
+                .then(() => {
+                    signal.throwIfAborted();
+                    if (element.playbackRate === element.defaultPlaybackRate) element.playbackRate = rate;
+                    return feedEpoch(
                         element,
                         source,
                         audio,
                         target,
                         { media, signal, appended },
                         audio.channels > 2 ? outputLayout : 'stereo'
-                    )
-                )
+                    );
+                })
                 .catch((error) => {
                     if (!signal.aborted) {
                         epoch?.abort();

@@ -1,5 +1,5 @@
-import { MATROSKA, MPEG_TS, type InputFormat, type InputOptions } from 'mediabunny';
-import { afterEach, expect, it, vi } from 'vitest';
+import { MATROSKA, MPEG_TS, UrlSource, type InputFormat, type InputOptions } from 'mediabunny';
+import { afterEach, assert, beforeEach, expect, it, vi } from 'vitest';
 
 import { prepareNativeDtsPlayback } from 'webgpu-player/embed/NativeDtsPlayback';
 
@@ -7,6 +7,7 @@ const opened = vi.fn<(options: InputOptions) => void>();
 const getFormat = vi.fn<() => InputFormat>(() => MATROSKA);
 const getSize = vi.fn<() => number | null>();
 const getEndTime = vi.fn<() => number>();
+const trackConfig = vi.fn((codec: string) => ({ codec }));
 
 vi.mock('mediabunny', async (original) => ({
     ...await original<typeof import('mediabunny')>(),
@@ -30,7 +31,7 @@ vi.mock('mediabunny', async (original) => ({
                 ['aac', 'mp4a.40.2', 'eng']
             ].map(([codec, config, language], index) => ({
                 getCodec: () => codec,
-                getDecoderConfig: () => ({ codec: config }),
+                getDecoderConfig: () => trackConfig(config),
                 getLanguageCode: () => language,
                 getName: () => null,
                 getDisposition: () => ({ default: index === 0 }),
@@ -47,6 +48,10 @@ vi.mock('webgpu-player/decode/packages/DecoderPackage', () => ({
     loadDecoderPackage: () => ({ kind: 'audio' })
 }));
 vi.mock('@mediabunny/flac-encoder', () => ({ registerFlacEncoder: () => undefined }));
+
+beforeEach(() => {
+    vi.stubGlobal('__WEBGPU_PLAYER_DECODER_PACKAGES__', { dts: 'dts-digest', truehd: 'truehd-digest' });
+});
 
 afterEach(() => {
     vi.unstubAllGlobals();
@@ -145,6 +150,48 @@ it('only reads the end of a finite transport stream and requires playable time a
         expect(opened.mock.lastCall?.[0].formats).toContain(MPEG_TS);
         expect(player?.tracks.map(({ codec }) => codec)).toContain('dts');
         expect(getEndTime).toHaveBeenCalledTimes(2);
+    } finally {
+        owner.abort();
+    }
+});
+
+it('declines missing decoder packages and keeps playable companions when another track has invalid metadata', async () => {
+    vi.stubGlobal('MediaSource', { isTypeSupported: (mime: string) => !['mlpa', 'vorbis', 'dtsl'].some(codec => mime.includes(codec)) });
+    vi.stubGlobal('AudioContext', class { destination = { maxChannelCount: 2 }; close = vi.fn(); });
+    // eslint-disable-next-line compat/compat -- The native playback path requires AbortController.
+    const owner = new AbortController();
+    const open = () => prepareNativeDtsPlayback(document.createElement('video'), 'https://example.test/movie.mkv', {}, owner.signal, vi.fn());
+    try {
+        vi.stubGlobal('__WEBGPU_PLAYER_DECODER_PACKAGES__', {});
+        expect(await open()).toBeNull();
+        vi.stubGlobal('__WEBGPU_PLAYER_DECODER_PACKAGES__', { dts: 'dts-digest' });
+        trackConfig.mockImplementation(codec => {
+            if (codec === 'mp4a.40.2') throw new Error('Invalid codec private data');
+            return { codec };
+        });
+        const player = await open();
+        expect(player?.tracks.map(({ ordinal, codec }) => [ordinal, codec])).toEqual([[2, 'dts']]);
+        expect(player?.selected()).toBe(2);
+    } finally {
+        owner.abort();
+    }
+});
+
+it('recovers a transient HTTP error when reading a prepared source', async () => {
+    vi.stubGlobal('MediaSource', { isTypeSupported: () => true });
+    vi.stubGlobal('AudioContext', class { destination = { maxChannelCount: 2 }; close = vi.fn(); });
+    const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response(null, { status: 503 }))
+        .mockResolvedValueOnce(new Response(new Uint8Array(2), { status: 206, headers: { 'Content-Range': 'bytes 0-1/2' } }));
+    vi.stubGlobal('fetch', fetch);
+    // eslint-disable-next-line compat/compat -- The native playback path requires AbortController.
+    const owner = new AbortController();
+    try {
+        expect(await prepareNativeDtsPlayback(document.createElement('video'), 'https://example.test/movie.mkv', {}, owner.signal, vi.fn())).not.toBeNull();
+        const source = opened.mock.lastCall![0].source;
+        assert(source instanceof UrlSource);
+        expect(await source.getSizeOrNull()).toBe(2);
+        expect(fetch).toHaveBeenCalledTimes(2);
     } finally {
         owner.abort();
     }

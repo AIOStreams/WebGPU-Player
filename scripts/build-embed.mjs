@@ -2,8 +2,9 @@
 // Builds src/embed into the served assets, beside the decoder packages it loads, after scripts/build.mjs.
 // Usage: node scripts/build-embed.mjs [--production]
 
+import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 
 import { build } from 'esbuild';
@@ -21,8 +22,11 @@ const packages = existsSync(DECODER_OUTPUT_DIRECTORY) ?
     readdirSync(DECODER_OUTPUT_DIRECTORY).filter(name => name.endsWith('.wasm')).sort() :
     [];
 mkdirSync(join(LIBRARY_OUTPUT_DIRECTORY, 'wgpud'), { recursive: true });
+const decoderKeys = {};
 for (const name of packages) {
-    copyFileSync(join(DECODER_OUTPUT_DIRECTORY, name), join(LIBRARY_OUTPUT_DIRECTORY, 'wgpud', name));
+    const source = join(DECODER_OUTPUT_DIRECTORY, name);
+    decoderKeys[basename(name, '.wasm')] = createHash('sha256').update(readFileSync(source)).digest('hex').slice(0, 16);
+    copyFileSync(source, join(LIBRARY_OUTPUT_DIRECTORY, 'wgpud', name));
 }
 
 await build({
@@ -30,7 +34,7 @@ await build({
     bundle: true,
     define: {
         __WEBGPU_PLAYER_ASSET_KEY__: JSON.stringify(assetKey),
-        __WEBGPU_PLAYER_DECODER_PACKAGES__: JSON.stringify(packages)
+        __WEBGPU_PLAYER_DECODER_PACKAGES__: JSON.stringify(decoderKeys)
     },
     entryPoints: [ 'EmbeddedPlayer', 'NativeDtsPlayback' ].map(name => join(SOURCE_DIRECTORY, 'embed', name + '.ts')),
     alias: { mediabunny: join(ENGINE_ROOT, 'vendor', 'mediabunny', 'dist', 'modules', 'src', 'index.js') },
