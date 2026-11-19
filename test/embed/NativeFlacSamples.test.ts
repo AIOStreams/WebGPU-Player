@@ -25,7 +25,7 @@ it('trims seek preroll and overlapping PCM across flushes while preserving a rea
         const pcm = new Int16Array(sample.numberOfFrames * 2);
         sample.copyTo(pcm, { planeIndex: 0 });
         expect(Array.from(pcm.slice(0, 2))).toEqual([32767, -32768]);
-    } }, 1, 'stereo');
+    } }, 1, 'stereo', 48_000);
     await samples.writeBlocks([block(0.99, 960)]);
     await samples.flush();
     await samples.writeBlocks([block(1, 480), block(1.005, 480), block(1.0154, 480), block(1.05, 480)]);
@@ -41,11 +41,11 @@ it('writes continuous zero PCM before the first sample and after the last one', 
         expect(sample.numberOfFrames).toBeLessThanOrEqual(8192);
         sample.copyTo(pcm.subarray(frames * 2), { planeIndex: 0 });
         frames += sample.numberOfFrames;
-    } }, 10, 'stereo');
-    await samples.padTo(0.2, 48_000);
+    } }, 10, 'stereo', 48_000);
+    await samples.padTo(0.2);
     await samples.writeBlocks([block(10.25, 12_000)]);
     await samples.flush();
-    await samples.padTo(0.75, 96_000);
+    await samples.padTo(0.75);
     await samples.flush();
     expect(frames).toBe(36_000);
     expect(pcm.subarray(0, 24_000).every(value => value === 0)).toBe(true);

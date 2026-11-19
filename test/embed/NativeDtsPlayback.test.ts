@@ -28,7 +28,7 @@ vi.mock('mediabunny', async (original) => ({
         getFirstTimestamp = firstTimestamp;
 
         getPrimaryVideoTrack() {
-            return { getCodec: videoCodec, getDecoderConfig: videoConfig, getDolbyVisionConfig: visionConfig, getRotation: () => 0 };
+            return { getCodec: videoCodec, getDecoderConfig: videoConfig, getDolbyVisionConfig: visionConfig, getTransformationMatrix: () => [1, 0, 0, 0, 1, 0, 0, 0, 1] };
         }
 
         getAudioTracks() {

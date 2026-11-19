@@ -19,7 +19,7 @@ import {
     type InputAudioTrack,
     type InputTrack,
     type InputVideoTrack,
-    type Rotation
+    type TransformationMatrix
 } from 'mediabunny';
 
 import { isSupportedTrueHDInputRoute } from '../audio/CustomCompressedAudioRoute';
@@ -72,9 +72,12 @@ function waitFor(target: EventTarget, event: string, signal: AbortSignal, action
     });
 }
 
+type Epoch = { media: MediaSource; signal: AbortSignal; appended(): void; intentionallyPaused(): boolean };
+
 const bufferedStart = (buffer: SourceBuffer): number => buffer.buffered.length ? buffer.buffered.start(0) : Infinity;
 
-async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBuffer>, element: HTMLVideoElement, signal: AbortSignal) {
+async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBuffer>, element: HTMLVideoElement, epoch: Epoch) {
+    const { signal } = epoch;
     let trimThreshold = 4;
     let keepBehind = 1.5;
     let stalled = 0;
@@ -85,24 +88,31 @@ async function appendFragment(buffer: SourceBuffer, fragment: Uint8Array<ArrayBu
         if (element.currentTime - bufferedStart(buffer) > trimThreshold) {
             await waitFor(buffer, 'updateend', signal, () => buffer.remove(0, element.currentTime - keepBehind));
         }
+        let quotaError: DOMException;
         try {
             await waitFor(buffer, 'updateend', signal, () => buffer.appendBuffer(fragment));
             return;
         } catch (error) {
             if (!(error instanceof DOMException && error.name === 'QuotaExceededError')) throw error;
-            const start = bufferedStart(buffer);
-            stalled = element.currentTime > lastTime || start > lastStart ? 0 : stalled + 1;
-            if (stalled >= 10) throw error;
-            lastTime = element.currentTime;
-            lastStart = start;
-            trimThreshold = 2;
-            keepBehind = 1;
+            quotaError = error;
         }
+        if (epoch.intentionallyPaused()) {
+            await waitFor(element, 'play', signal);
+            stalled = 0;
+            continue;
+        }
+        const start = bufferedStart(buffer);
+        stalled = element.currentTime > lastTime || start > lastStart ? 0 : stalled + 1;
+        if (stalled >= 10) throw quotaError;
+        lastTime = element.currentTime;
+        lastStart = start;
+        trimThreshold = 2;
+        keepBehind = 1;
         await sleep(150);
     }
 }
 
-function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, signal: AbortSignal, appended: () => void) {
+function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, epoch: Epoch) {
     let header: Uint8Array | null = null;
     let ready = Promise.resolve();
     const first = (data: Uint8Array): void => {
@@ -115,8 +125,8 @@ function fragmentOutput(buffer: SourceBuffer, element: HTMLVideoElement, signal:
         fragment.set(data, header.byteLength);
         header = null;
         ready = ready.then(async () => {
-            await appendFragment(buffer, fragment, element, signal);
-            appended();
+            await appendFragment(buffer, fragment, element, epoch);
+            epoch.appended();
         });
         // The packet producer awaits the same promise after each write.
         void ready.catch(() => undefined);
@@ -206,7 +216,7 @@ type NativeSource = {
     codec: NonNullable<Awaited<ReturnType<InputVideoTrack['getCodec']>>>;
     config: VideoDecoderConfig;
     videoMime: string;
-    rotation: Rotation;
+    transformationMatrix: TransformationMatrix;
     dolbyVisionConfig?: Uint8Array;
     duration: number;
     origin: number;
@@ -248,6 +258,25 @@ async function nativeEnd(input: Input, tracks: InputTrack[], transport: boolean)
     }
 }
 
+// A decoded packet can yield no PCM until a later packet or the final drain. Keep one batch
+// ahead so even a long leading gap can be written incrementally at the actual decoder rate.
+async function* audioPackets(reader: PacketReader, first: EncodedPacket, decoder: PackageSoftwareAudioDecoder | undefined, signal: AbortSignal) {
+    let packet: EncodedPacket | null = first;
+    while (packet) {
+        signal.throwIfAborted();
+        if (decoder) {
+            const blocks = decoder.decode(packet.data, secondsToMicroseconds(packet.timestamp));
+            if (blocks.length) yield { blocks, timestamp: microsecondsToSeconds(blocks[0].mediaTimeMicroseconds) };
+        } else {
+            yield { packet, timestamp: packet.timestamp };
+        }
+        packet = await reader.getNext(packet);
+    }
+    const tail = decoder?.drain();
+    if (tail?.length) yield { blocks: tail, timestamp: microsecondsToSeconds(tail[0].mediaTimeMicroseconds) };
+    return null;
+}
+
 // An epoch owns its muxers, decoder, SourceBuffers and object URL. A seek outside the buffer or an audio
 // change starts at the preceding keyframe and keeps the original file's clock for subtitles and resume.
 async function feedEpoch(
@@ -255,7 +284,7 @@ async function feedEpoch(
     source: NativeSource,
     audio: AudioChoice,
     target: number,
-    session: { media: MediaSource; signal: AbortSignal; appended: () => void },
+    session: Epoch,
     outputLayout: 'stereo' | '5.1'
 ): Promise<void> {
     const { media, signal, appended } = session;
@@ -276,10 +305,10 @@ async function feedEpoch(
     videoBuffer.timestampOffset = playbackStart;
     audioBuffer.timestampOffset = playbackStart;
     element.currentTime = Math.max(playbackStart, target);
-    const video = fragmentOutput(videoBuffer, element, signal, appended);
-    const sound = fragmentOutput(audioBuffer, element, signal, appended);
+    const video = fragmentOutput(videoBuffer, element, session);
+    const sound = fragmentOutput(audioBuffer, element, session);
     const picture = new EncodedVideoPacketSource(source.codec);
-    video.output.addVideoTrack(picture, { rotation: source.rotation, dolbyVisionConfig: source.dolbyVisionConfig });
+    video.output.addVideoTrack(picture, { transformationMatrix: source.transformationMatrix, dolbyVisionConfig: source.dolbyVisionConfig });
     const flac = audio.softwareCodec ? new AudioSampleSource({ codec: 'flac' }) : null;
     const passthrough = flac ? null : new EncodedAudioPacketSource(audio.codec);
     sound.output.addAudioTrack(flac ?? passthrough!);
@@ -292,8 +321,11 @@ async function feedEpoch(
             decoder.setRenderTarget({ channelMask: getCustomAudioOutputChannelMask(outputLayout), binaural: false });
         }
         await Promise.all([video.output.start(), sound.output.start()]);
-        const samples = flac ? flacSamples(flac, start, outputLayout) : null;
-        const rate = samples ? await audio.track.getSampleRate() : 0;
+        const packets = audioPackets(ar, audioStart, decoder, signal);
+        let nextAudio = (await packets.next()).value;
+        if (!nextAudio) throw new Error('No decodable audio samples');
+        const firstAudioTime = nextAudio.timestamp;
+        const samples = flac && nextAudio.blocks ? flacSamples(flac, start, outputLayout, nextAudio.blocks[0].sampleRate) : null;
         const playhead = Math.max(start, target + source.origin);
         let nextVideo: EncodedPacket | null = key;
         let videoEnd = start;
@@ -312,11 +344,11 @@ async function feedEpoch(
             await video.ready();
         };
         let audioEnd = start;
-        let nextAudio: EncodedPacket | null = audioStart;
-        const addAudio = async (packet: EncodedPacket): Promise<void> => {
-            if (decoder && samples) {
-                await samples.writeBlocks(decoder.decode(packet.data, secondsToMicroseconds(packet.timestamp)));
-            } else if (passthrough && packet.timestamp >= start) {
+        const addAudio = async (data: NonNullable<typeof nextAudio>): Promise<void> => {
+            if (data.blocks && samples) {
+                await samples.writeBlocks(data.blocks);
+            } else if (data.packet && passthrough && data.timestamp >= start) {
+                const packet = data.packet;
                 audioEnd = Math.max(audioEnd, packet.timestamp + packet.duration);
                 await passthrough.add(
                     packet.clone({ timestamp: packet.timestamp - start }),
@@ -326,7 +358,6 @@ async function feedEpoch(
         };
         const finishAudioInput = async (): Promise<void> => {
             if (decoder && samples) {
-                await samples.writeBlocks(decoder.drain());
                 decoder.close();
                 decoder = undefined;
                 await samples.flush();
@@ -335,7 +366,7 @@ async function feedEpoch(
             }
         };
         const writeAudio = async (end: number): Promise<void> => {
-            if (samples && audioStart.timestamp > start) await samples.padTo(Math.min(end, audioStart.timestamp) - start, rate);
+            if (samples && firstAudioTime > start) await samples.padTo(Math.min(end, firstAudioTime) - start);
             while (nextAudio) {
                 if (passthrough && audioEnd === start && nextAudio.timestamp > playhead + 0.1) {
                     throw new Error('Passthrough audio starts after the playhead');
@@ -343,7 +374,7 @@ async function feedEpoch(
                 if (nextAudio.timestamp >= end) break;
                 signal.throwIfAborted();
                 await addAudio(nextAudio);
-                nextAudio = await ar.getNext(nextAudio);
+                nextAudio = (await packets.next()).value;
                 if (!nextAudio) await finishAudioInput();
             }
             await sound.ready();
@@ -351,7 +382,7 @@ async function feedEpoch(
         const fillAudioTail = async (end: number): Promise<void> => {
             if (samples) {
                 // Follow the actual video packets; a long silent tail stays within the normal read-ahead.
-                await samples.padTo(Math.min(end, videoEnd) - start, rate);
+                await samples.padTo(Math.min(end, videoEnd) - start);
                 await samples.flush();
                 await sound.ready();
             } else if (videoEnd > audioEnd + 0.1) {
@@ -466,10 +497,10 @@ export async function prepareNativeDtsPlayback(
         const isTransportStream = await input.getFormat() === MPEG_TS;
         if (isTransportStream && await input.source.getSizeOrNull() === null) return null;
         const playableTracks = [video, ...tracks.flatMap((audio) => audio ? [audio.track] : [])];
-        const [codec, config, rotation, end, originTime] = await Promise.all([
+        const [codec, config, transformationMatrix, end, originTime] = await Promise.all([
             video.getCodec(),
             video.getDecoderConfig(),
-            video.getRotation(),
+            video.getTransformationMatrix(),
             nativeEnd(input, playableTracks, isTransportStream),
             readPlaybackTimelineOriginMicroseconds(input, playableTracks)
         ]);
@@ -478,7 +509,7 @@ export async function prepareNativeDtsPlayback(
         if (!codec || !config || !Number.isFinite(duration) || duration <= 0) return null;
         const format = nativeVideoFormat(video, codec, config);
         if (!format) return null;
-        const source: NativeSource = { video, codec, config, rotation, duration, origin, ...format };
+        const source: NativeSource = { video, codec, config, transformationMatrix, duration, origin, ...format };
         owner.throwIfAborted();
         let selected = tracks.findIndex((track) => track?.isDefault);
         if (selected < 0) selected = tracks.findIndex((track) => track !== null);
@@ -529,7 +560,10 @@ export async function prepareNativeDtsPlayback(
                         source,
                         audio,
                         target,
-                        { media, signal, appended },
+                        {
+                            media, signal, appended,
+                            intentionallyPaused: () => !priming && element.paused && (paused || element.played.length > 0)
+                        },
                         audio.channels > 2 ? outputLayout : 'stereo'
                     );
                 })

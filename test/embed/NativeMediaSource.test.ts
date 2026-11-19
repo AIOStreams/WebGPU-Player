@@ -11,7 +11,8 @@ const duration = 14;
 const sampleRate = 48_000;
 const packet = (time: number) => new EncodedPacket(new Uint8Array(1), 'key', time, 1);
 const ranges = (spans: Span[]) => ({ length: spans.length, start: (i: number) => spans[i][0], end: (i: number) => spans[i][1] });
-const fixture = { first: 0, end: duration, rotation: 0, quota: 'none' as 'none' | 'full' | 'recover' };
+const fixture = { first: 0, end: duration, limit: 6, quota: 'none' as 'none' | 'full' | 'recover' };
+const matrix = [-1, 0, 0, 0, 1, 0, 320, 0, 1];
 const metadata = vi.fn<(options: VideoTrackMetadata) => void>();
 const soundEnd = vi.fn();
 let rejections = 0;
@@ -27,7 +28,7 @@ class BufferDouble extends EventTarget {
             const [a, b] = new Float64Array(bytes.buffer, bytes.byteOffset, 2);
             const start = a + this.timestampOffset;
             const end = b + this.timestampOffset;
-            if (this.video && (fixture.quota === 'full' || (fixture.quota === 'recover' && this.spans.length && end - this.spans[0][0] > 6))) {
+            if (this.video && (fixture.quota === 'full' || (fixture.quota === 'recover' && this.spans.length && end - this.spans[0][0] > fixture.limit))) {
                 rejections++;
                 throw new DOMException('Full', 'QuotaExceededError');
             }
@@ -103,7 +104,7 @@ vi.mock('mediabunny', async (original) => ({
     ...await original<typeof import('mediabunny')>(),
     Input: class {
         getPrimaryVideoTrack() {
-            return { video: true, getCodec: () => 'avc', getDecoderConfig: () => ({ codec: 'avc1' }), getRotation: () => fixture.rotation };
+            return { video: true, getCodec: () => 'avc', getDecoderConfig: () => ({ codec: 'avc1' }), getTransformationMatrix: () => matrix };
         }
         getAudioTracks() {
             return ['dts', 'aac'].map(codec => ({
@@ -148,7 +149,7 @@ vi.mock('webgpu-player/decode/audio/PackageSoftwareAudioDecoder', () => ({
 let media: MediaDouble;
 beforeEach(() => {
     vi.useFakeTimers();
-    Object.assign(fixture, { first: 0, end: duration, rotation: 0, quota: 'none' });
+    Object.assign(fixture, { first: 0, end: duration, limit: 6, quota: 'none' });
     rejections = removals = 0;
     vi.stubGlobal('MediaSource', MediaDouble);
     vi.stubGlobal('URL', class extends URL {
@@ -168,22 +169,38 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-async function run(ordinal = 0) {
+async function run(ordinal = 0, pause?: 'resume' | 'abort') {
     // eslint-disable-next-line compat/compat -- The native playback path requires AbortController.
     const owner = new AbortController();
     const element = document.createElement('video');
-    element.autoplay = true;
+    element.autoplay = !pause;
     Object.defineProperty(element, 'buffered', { get: () => ranges(media.joint) });
-    const play = vi.spyOn(element, 'play').mockResolvedValue();
+    let playing = false;
+    Object.defineProperty(element, 'paused', { get: () => !playing });
+    vi.spyOn(element, 'pause').mockImplementation(() => {
+        playing = false;
+    });
+    const play = vi.spyOn(element, 'play').mockImplementation(async () => {
+        playing = true;
+        element.dispatchEvent(new Event('play'));
+    });
     const failed = vi.fn();
     try {
         const player = await prepareNativeDtsPlayback(element, 'https://example.test/movie.mkv', {}, owner.signal, failed);
         expect(player).not.toBeNull();
         player!.start(0, ordinal);
+        if (pause) {
+            await vi.advanceTimersByTimeAsync(3000);
+            expect(rejections).toBe(1);
+            expect(failed).not.toHaveBeenCalled();
+            expect(element.currentTime).toBe(0);
+            if (pause === 'resume') player!.setPaused(false);
+            else owner.abort();
+        }
         for (let tick = 0; tick < 210 && !failed.mock.calls.length && element.currentTime < duration; tick++) {
             await vi.advanceTimersByTimeAsync(100);
             const span = media.joint.find(([start, end]) => start <= element.currentTime + 1e-5 && end > element.currentTime);
-            if (play.mock.calls.length && span) element.currentTime = Math.min(span[1], element.currentTime + 0.125);
+            if (playing && span) element.currentTime = Math.min(span[1], element.currentTime + 0.125);
         }
         return { errors: failed.mock.calls, played: play.mock.calls.length, time: element.currentTime, ended: media.readyState === 'ended' };
     } finally {
@@ -212,8 +229,15 @@ it('resumes appending when the clock advances and the back buffer can be freed',
     expect(removals).toBeGreaterThan(0);
     expect(rejections).toBeGreaterThan(0);
 });
-it('passes the input rotation to the video muxer', async () => {
-    fixture.rotation = 90;
+it.each(['resume', 'abort'] as const)('waits for %s on a full buffer after priming while paused', async action => {
+    fixture.quota = 'recover';
+    fixture.limit = 3.5;
+    const result = await run(0, action);
+    expect(result.errors).toEqual([]);
+    expect(result.time).toBe(action === 'resume' ? duration : 0);
+    expect(result.ended).toBe(action === 'resume');
+});
+it('passes the entire input display matrix to the video muxer', async () => {
     await run();
-    expect(metadata).toHaveBeenCalledWith(expect.objectContaining({ rotation: 90 }));
+    expect(metadata).toHaveBeenCalledWith(expect.objectContaining({ transformationMatrix: matrix }));
 });

@@ -3,7 +3,7 @@ import { AudioSample, type AudioSampleSource } from 'mediabunny';
 import { prepareCustomAudioOutputChannelData } from '../audio/processing/CustomAudioChannelLayout';
 import type { PackageDecodedAudioOutput } from '../decode/audio/PackageSoftwareAudioDecoder';
 
-export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number, outputLayout: 'stereo' | '5.1') {
+export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number, outputLayout: 'stereo' | '5.1', rate: number) {
     // Each AudioSample sent to the FLAC worker carries several decoded blocks.
     const channels = outputLayout === '5.1' ? 6 : 2;
     const capacity = 8192;
@@ -11,7 +11,6 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
     // Use 16-bit FLAC for the stereo downmix and preserve up to 24 bits for multichannel output.
     const pcm = stereo ? new Int16Array(capacity * channels) : new Float32Array(capacity * channels);
     let frames = 0;
-    let rate = 0;
     let nextTime = 0;
     let started = false;
     let timestamp = 0;
@@ -32,9 +31,7 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
         frames = 0;
     };
     // Fill in bounded PCM batches so a late or short track never requires a gap-sized allocation.
-    const padTo = async (time: number, fallbackRate: number): Promise<void> => {
-        // Once PCM exists, continue at the decoded rate even if the container advertises a different rate.
-        rate ||= fallbackRate;
+    const padTo = async (time: number): Promise<void> => {
         let remaining = Math.round((time - nextTime) * rate);
         if (remaining <= 0) return;
         while (remaining > 0) {
@@ -66,9 +63,9 @@ export function flacSamples(flac: Pick<AudioSampleSource, 'add'>, start: number,
         if (skip >= block.frameCount) return;
         const first = time + skip / block.sampleRate;
         const gap = first > nextTime + 0.002;
-        if (frames && (rate !== block.sampleRate || gap)) await flush();
-        rate = block.sampleRate;
-        if (gap && !started) await padTo(first, rate);
+        if (rate !== block.sampleRate) throw new Error('Decoded sample rate changed during FLAC playback');
+        if (frames && gap) await flush();
+        if (gap && !started) await padTo(first);
         const begin = gap ? Math.max(first, nextTime) : nextTime;
         await copyBlock(block, skip, begin);
         started = true;
