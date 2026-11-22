@@ -309,6 +309,24 @@ function appendVector(
     });
 }
 
+/** How play() settles, bounded: some platforms (webOS) leave it pending while no decoder is free. */
+function playWithin(audioElement: HTMLAudioElement, timeoutMicroseconds: Microseconds): Promise<'played' | 'rejected' | 'timeout'> {
+    return new Promise(resolve => {
+        const timeout = globalThis.setTimeout((): void => resolve('timeout'), microsecondsToMilliseconds(timeoutMicroseconds));
+        // The teardown's pause rejects a play() that is still pending
+        audioElement.play().then(
+            (): void => {
+                globalThis.clearTimeout(timeout);
+                resolve('played');
+            },
+            (): void => {
+                globalThis.clearTimeout(timeout);
+                resolve('rejected');
+            }
+        );
+    });
+}
+
 function waitForPlaybackAdvance(audioElement: HTMLAudioElement, timeoutMicroseconds: Microseconds): Promise<boolean> {
     const startingTimeMicroseconds = secondsToMicroseconds(audioElement.currentTime);
     return new Promise<boolean>(resolve => {
@@ -385,10 +403,9 @@ async function runDefaultExactPlaybackProbe(
             mediaSource.endOfStream();
         }
 
-        try {
-            await audioElement.play();
-        } catch {
-            return { reason: 'playback-failed', supported: false };
+        const played = await playWithin(audioElement, PROBE_TIMEOUT_MICROSECONDS);
+        if (played !== 'played') {
+            return { reason: played === 'timeout' ? 'probe-timeout' : 'playback-failed', supported: false };
         }
         const advanced = await waitForPlaybackAdvance(audioElement, PROBE_TIMEOUT_MICROSECONDS);
         return advanced ?
